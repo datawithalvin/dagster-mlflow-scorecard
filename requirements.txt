@@ -1,0 +1,14 @@
+pandas
+polars
+scikit-learn
+optbinning
+statsmodels
+dagster
+dagster-webserver
+mlflow
+scorecardpy==0.1.9.7
+psycopg2
+sqlalchemy
+connectorx
+duckdb
+duckdb_engine
