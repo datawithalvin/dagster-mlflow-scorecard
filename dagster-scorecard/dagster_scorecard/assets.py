@@ -12,8 +12,21 @@ from dagster import (
 
 from optbinning import BinningProcess
 
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import auc, roc_auc_score, roc_curve, classification_report, ConfusionMatrixDisplay, confusion_matrix
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder
-from sklearn.feature_selection import chi2
+from sklearn.feature_selection import chi2, SelectFromModel
+
+import matplotlib.pyplot as plt
+
+import mlflow
+from mlflow.tracking import MlflowClient
+import mlflow.sklearn
+from mlflow.models import infer_signature
+from mlflow.data.pandas_dataset import PandasDataset
 
 ## =============== prep =============== 
 @asset(
@@ -34,6 +47,8 @@ def train_test_set(context):
         query = """SELECT * FROM train_test_set"""
         conn = duckdb.connect(os.getenv("DUCKDB_DATABASE"))
         train_test_set = conn.execute(query).fetch_df()
+        train_test_set.drop_duplicates(subset=['id'], keep='first', inplace=True, ignore_index=True)
+
 
         ## log dataframe
         context.log.info("train-test shape: %s", train_test_set.shape)
@@ -160,7 +175,7 @@ def significant_features(context):
         keep_features_list.extend(["id", "credit_event"])
 
         applications_initial_filter = train_data_df[keep_features_list]
-        applications_initial_filter.reset_index(drop=False, inplace=True) ## reset index biar id-nya jadi ke kolom lagi
+        # applications_initial_filter.reset_index(drop=False, inplace=True) ## reset index biar id-nya jadi ke kolom lagi
 
         ## log dataframe
         context.log.info("number of significant features: %d", len(signficant_features))
@@ -308,66 +323,314 @@ def filtered_by_multicollinearity(context):
     
 
 # --------- feature selection zone ---------
+# @asset(
+#     deps=["filtered_by_multicollinearity"],
+#     group_name="feature_selection",
+#     code_version="0.1",
+#     tags={"asset_type":"pandas-dataframe"},
+#     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
+#     compute_kind="pandas"
+# )
+# def transformed_applications(context):
+#     """
+#         transformed values ke woe per karakteristik fitur
+#     """
+#     try:
+#         applications = pd.read_csv("./data/outputs/applications-final-filter.csv")
+#         variable_names = list(applications.columns[:-2]) # exclude id dan credit event
+
+#         X = applications[variable_names]
+#         y = applications["credit_event"].values
+
+#         def is_dichotomic(column):
+#             unique_values = column.dropna().unique()
+#             return len(unique_values) == 2 and np.issubdtype(unique_values.dtype, np.integer)
+
+#         dichotomic_feats = [col for col in applications.columns if col != 'credit_event' and is_dichotomic(applications[col])]
+
+#         binning_process = BinningProcess(variable_names, categorical_variables=dichotomic_feats)
+#         binning_process.fit(X, y)
+
+#         summary_table = binning_process.summary()
+#         summary_table.sort_values(by="iv", ascending=False, inplace=True)
+#         transformed_table = binning_process.fit_transform(X, y, metric="woe", check_input=True)
+
+#         merged_by_index = pd.merge(transformed_table, applications[["id", "credit_event"]], left_index=True, right_index=True)
+
+#         # log the head of the final filtered dataframe
+#         context.log.info("transformed applications: \n%s", merged_by_index.head())
+
+#         filtered_shape = merged_by_index.shape
+
+#         filtered_columns = [
+#             TableColumn(
+#                 name=col,
+#                 type=str(merged_by_index[col].dtype),
+#                 description=f"Sample value: {merged_by_index[col].iloc[33]}"
+#             )
+#             for col in merged_by_index.columns
+#         ]
+
+#         yield MaterializeResult(
+#             asset_key="transformed_applications",
+#             metadata={
+#                 "dagster/column_schema": TableSchema(columns=filtered_columns),
+#                 "dagster/type": "pandas-dataframe",
+#                 "dagster/column_count": filtered_shape[1], 
+#                 "dagster/row_count": filtered_shape[0]
+#             }
+#         )
+
+#         return merged_by_index.to_csv("./data/outputs/transformed-applications.csv", index=False)
+    
+#     except Exception as e:
+#         context.log.error("An error occurred while filtering highly correlated features: %s", str(e))
+#         raise e
+
 @asset(
     deps=["filtered_by_multicollinearity"],
     group_name="feature_selection",
     code_version="0.1",
-    tags={"asset_type":"pandas-dataframe"},
+    tags={"asset_type":"ml-model"},
+    owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
+    compute_kind="scikitlearn"
+)
+def mlflow_rf_model():
+    """
+    Random Forest model for feature selection using MLflow for experiment tracking.
+    """
+    try:
+        ## load data 
+        df = pd.read_csv("./data/outputs/applications-final-filter.csv")
+        df.set_index("id", inplace=True)
+
+        def is_dichotomic(column):
+                    import numpy as np
+                    unique_values = column.dropna().unique()
+                    return len(unique_values) == 2 and np.issubdtype(unique_values.dtype, np.integer)
+
+        ## baseline
+        variable_names = list(df.copy().drop(labels=["credit_event"], axis=1).columns) ## <-- exclude credit event
+        X = df[variable_names]
+        y = df["credit_event"].values
+
+        dichotomic_feats = [col for col in df.columns if col != 'credit_event' and is_dichotomic(df[col])]
+        
+        ## binning
+        binning_process = BinningProcess(variable_names,
+                                categorical_variables=dichotomic_feats)
+        binning_process.fit(X, y)
+
+        ## transform menjadi bin
+        transformed_table = binning_process.fit_transform(X, y, metric="woe", check_input=True).reset_index(drop=False)
+
+        to_merge = df[["credit_event"]].reset_index(drop=False)
+        to_merge.drop_duplicates(subset=['id'], keep='last', inplace=True, ignore_index=True)
+        transformed_applications = pd.merge(transformed_table, to_merge, left_on="id", right_on="id", how="inner") ## <-- merge by id
+        transformed_applications.drop_duplicates(subset=['id'], keep='last', inplace=True, ignore_index=True)
+
+        ## training random forest dengan transformed data
+        variable_names = list(transformed_applications.copy().drop(labels=["credit_event"], axis=1).columns)
+        X = transformed_applications[variable_names]
+        y = transformed_applications["credit_event"].values
+
+        ## split
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=777)
+
+        ## init classifier
+        param_grid = {
+            'n_estimators': [100, 200, 300, 400],
+            'max_features': ['auto', 'sqrt', 'log2'],
+            'max_depth': [10, 20, 30],
+            'min_samples_split': [2, 5],
+            'min_samples_leaf': [1, 2],
+            'bootstrap': [True, False]
+        }
+
+        rf = RandomForestClassifier(random_state=777)
+        rf_random = RandomizedSearchCV(estimator=rf, param_distributions=param_grid, n_iter=10, cv=3, verbose=2, random_state=777, n_jobs=-1)
+
+        mlflow.set_experiment("feature-selection-with-RF")
+
+        ## run experiment
+        with mlflow.start_run() as run:
+            mlflow.set_tag("use_case", "credit_scorecard")
+            mlflow.set_tag("dagster_zone", "feature_selection")
+
+            ## fit model
+            rf_random.fit(X_train, y_train)
+
+            ## log setiap parameter dan masing-masing scorenya
+            for i in range(len(rf_random.cv_results_['params'])):
+                params = rf_random.cv_results_['params'][i]
+                score = rf_random.cv_results_['mean_test_score'][i]
+                mlflow.log_param(f"Params_{i}", params)
+                mlflow.log_metric(f"Score_{i}", score)
+
+            ## log parameter dan score terbaik
+            best_params = rf_random.best_params_
+            best_score = float(rf_random.best_score_)
+            mlflow.log_params(best_params)
+            mlflow.log_metric("Best_Score", best_score)
+
+            ## extract estimator
+            best_rf = rf_random.best_estimator_
+
+            ## extract feature importances
+            importances = best_rf.feature_importances_
+            feature_importance_df = pd.DataFrame({'Feature': X.columns, 'Importance': importances})
+            feature_importance_df = feature_importance_df.sort_values(by='Importance', ascending=False)
+
+            ## ambil top N features, seenggaknya 50% dari jumlah original features
+            num_features_to_select = int(0.5 * len(X.columns))
+            top_features = feature_importance_df['Feature'][:num_features_to_select].values.tolist()  # Convert to list
+
+            ## log selected features
+            mlflow.log_param("Selected_Features", top_features)
+
+            ## filter dataset dengan selected features
+            X_train_selected = X_train[top_features]
+            X_test_selected = X_test[top_features]
+
+            ## retrain model dengan selected features
+            best_rf.fit(X_train_selected, y_train)
+
+            ## eval model
+            y_pred = best_rf.predict(X_test_selected)
+            report = classification_report(y_test, y_pred)
+            mlflow.log_text(report, "classification_report.txt")
+
+            ## log confusion matrix
+            cm = confusion_matrix(y_test, y_pred)
+            disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+            disp.plot()
+            plt.title('Confusion Matrix')
+            mlflow.log_figure(plt.gcf(), "confusion_matrix.png")
+            plt.close()
+
+            ## log model
+            mlflow.sklearn.log_model(best_rf, "random_forest_model")
+
+            ## log feature importance plot
+            plt.figure(figsize=(10, 10))
+            feature_importance_df[:num_features_to_select].plot(x='Feature', y='Importance', kind='bar')
+            plt.title('Top Feature Importances')
+            plt.tight_layout()
+            mlflow.log_figure(plt.gcf(), "feature_importances.png")
+            plt.close()
+
+        # return run ID dan selected features untuk downstream assets
+        return Output(
+            value={"run_id": run.info.run_id, "selected_features": top_features},
+            metadata={
+                "run_id": run.info.run_id,
+                "num_selected_features": len(top_features),
+                "selected_features":top_features,
+                # "best_score": best_score,
+                "mlflow_tracking_uri": "run: 'mlflow ui --backend-store-uri sqlite:///mlflow.db', then go to http://127.0.0.1:5000"
+            }
+        )
+
+    except Exception as e:
+        raise RuntimeError(f"An error occurred during Random Forest feature selection: {str(e)}")
+    
+## ----------------- feature selection ------------------
+@asset(
+    deps=["filtered_by_multicollinearity"],
+    ins={"mlflow_rf_model": AssetIn(key="mlflow_rf_model")},
+    group_name="feature_selection",
+    code_version="0.1",
+    tags={"asset_type": "pandas-dataframe"},
     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
     compute_kind="pandas"
 )
-def transformed_applications(context):
-    """
-        transformed values ke woe per karakteristik fitur
-    """
+def selected_features_data(context, mlflow_rf_model):
     try:
-        applications = pd.read_csv("./data/outputs/applications-final-filter.csv")
-        variable_names = list(applications.columns[:-2]) # exclude id dan credit event
+        # load transformed woe dataframe
+        df = pd.read_csv("./data/outputs/applications-final-filter.csv")
+        selected_features = mlflow_rf_model["selected_features"]
+        selected_features.extend(["id", "credit_event"])
 
-        X = applications[variable_names]
-        y = applications["credit_event"].values
+        selected_features_df = df[selected_features]
+        
+        context.log.info("selected features dataframe: \n%s", selected_features_df.head())
 
-        def is_dichotomic(column):
-            unique_values = column.dropna().unique()
-            return len(unique_values) == 2 and np.issubdtype(unique_values.dtype, np.integer)
-
-        dichotomic_feats = [col for col in applications.columns if col != 'credit_event' and is_dichotomic(applications[col])]
-
-        binning_process = BinningProcess(variable_names, categorical_variables=dichotomic_feats)
-        binning_process.fit(X, y)
-
-        summary_table = binning_process.summary()
-        summary_table.sort_values(by="iv", ascending=False, inplace=True)
-        transformed_table = binning_process.fit_transform(X, y, metric="woe", check_input=True)
-
-        merged_by_index = pd.merge(transformed_table, applications[["id", "credit_event"]], left_index=True, right_index=True)
-
-        # log the head of the final filtered dataframe
-        context.log.info("transformed applications: \n%s", merged_by_index.head())
-
-        filtered_shape = merged_by_index.shape
+        selected_shape = selected_features_df.shape
 
         filtered_columns = [
             TableColumn(
                 name=col,
-                type=str(merged_by_index[col].dtype),
-                description=f"Sample value: {merged_by_index[col].iloc[33]}"
+                type=str(selected_features_df[col].dtype),
+                description=f"Sample value: {selected_features_df[col].iloc[33]}"
             )
-            for col in merged_by_index.columns
+            for col in selected_features_df.columns
         ]
 
         yield MaterializeResult(
-            asset_key="transformed_applications",
+            asset_key="selected_features_data",
             metadata={
                 "dagster/column_schema": TableSchema(columns=filtered_columns),
                 "dagster/type": "pandas-dataframe",
-                "dagster/column_count": filtered_shape[1], 
-                "dagster/row_count": filtered_shape[0]
+                "dagster/column_count": selected_shape[1], 
+                "dagster/row_count": selected_shape[0]
             }
         )
 
-        return merged_by_index.to_csv("./data/outputs/transformed-applications.csv", index=False)
+        return selected_features_df.to_csv("./data/outputs/application_selected_features.csv", index=False)
     
     except Exception as e:
-        context.log.error("An error occurred while filtering highly correlated features: %s", str(e))
+        context.log.error("An error occurred while selecting features: %s", str(e))
         raise e
+    
+
+# --------- model exprimentation ---------
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+@asset(
+    group_name="credit_model_training"
+)
+def credit_model(selected_features_data):
+    """
+        deskripsi asset
+    """
+    try:
+        empty_list = []
+        return empty_list
+    
+    except Exception as e:
+        logger.error("An error occurred while filtering highly correlated features: %s", str(e))
+        raise e
+    
+@asset(
+    group_name="credit_model_training"
+)
+def model_coefficients(credit_model):
+    """
+        deskripsi asset
+    """
+    try:
+        empty_list = []
+        return empty_list
+    
+    except Exception as e:
+        logger.error("An error occurred while filtering highly correlated features: %s", str(e))
+        raise e
+
+
+@asset(
+    group_name="credit_model_training"
+)
+def score_card(model_coefficients):
+    """
+        deskripsi asset
+    """
+    try:
+        empty_list = []
+        return empty_list
+    
+    except Exception as e:
+        logger.error("An error occurred while filtering highly correlated features: %s", str(e))
+        raise e
+    
