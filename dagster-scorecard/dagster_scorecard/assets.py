@@ -2,6 +2,8 @@
 import pandas as pd
 import numpy as np
 import duckdb
+
+import logging
 import json
 import os
 
@@ -15,7 +17,7 @@ from optbinning import BinningProcess
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import auc, roc_auc_score, roc_curve, classification_report, ConfusionMatrixDisplay, confusion_matrix
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder
 from sklearn.feature_selection import chi2, SelectFromModel
@@ -28,11 +30,19 @@ import mlflow.sklearn
 from mlflow.models import infer_signature
 from mlflow.data.pandas_dataset import PandasDataset
 
+
+# --------- konfigurasi ---------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+mlflow_tracking_uri = f"sqlite:///{os.path.join(os.getcwd(), 'mlflow.db')}"
+mlflow.set_tracking_uri(mlflow_tracking_uri)
+
 ## =============== prep =============== 
 @asset(
     group_name="initial_prep",
     tags={"asset_type":"DuckDBResource", 
-          "data_source":"transactions.db"},
+          "data_source":"loan_data_2015.db"},
     code_version="0.1",
     owners=["alvinnoza.data@gmail.com", "team:Data Scientist"],
     compute_kind="duckdb",
@@ -78,11 +88,115 @@ def train_test_set(context):
     except Exception as e:
         context.log.error("An error occurred while build database connection/load credit application table: %s", str(e))
         raise e
+    
+
+@asset(
+    deps=["train_test_set"],
+    group_name="initial_prep",
+    tags={"asset_type":"pandas-dataframe", 
+          "data_source":"loan_data_2015.db"},
+    code_version="0.1",
+    owners=["alvinnoza.data@gmail.com", "team:Data Scientist"],
+    compute_kind="pandas",
+    description="Train-test set yang sudah dicleaning dan ditransformasi"
+)
+def prepared_train_test(context):
+    try:
+        """
+            Train-test set yang sudah dicleaning dan ditransformasi
+        """
+        ## load data
+        train_test_set = pd.read_csv("./data/outputs/train-test-set.csv")
+        train_test_set.drop_duplicates(subset=['id'], keep='first', inplace=True, ignore_index=True)
+
+        ## cleaning emp_length
+        def emp_length_converter(dataframe, column):
+            dataframe[column] = dataframe[column].replace({
+                r"\+ years": "",
+                r"< 1 year": "0",
+                r" years?": ""
+            }, regex=True)
+            
+            dataframe[column] = pd.to_numeric(dataframe[column], errors='coerce').fillna(0).astype(int)
+
+        ## apply
+        emp_length_converter(train_test_set, "emp_length")
+
+        ## remove whitespace
+        ## coba keep sbg categorical dulu aja
+        train_test_set["term"] = train_test_set["term"].str.lstrip()
+
+        ## last_pymnt_d dan last_credit_pull_d punya missing values, padahal kita butuh convert dan hitung time difference mereka
+        ## karena missingnya last_pymnt_d kurang dari 5%, rasanya masih save untuk didrop
+        ## drop rows 
+        train_test_set.dropna(subset=["last_pymnt_d", "last_credit_pull_d"], inplace=True)
+
+        ## cleaning date-related columns
+        def convert_and_calc_moths(df):
+            ## define kolom
+            date_columns = ['earliest_cr_line', 'issue_d', 'last_pymnt_d', 'last_credit_pull_d']
+            
+            # convert ke datetime
+            for col in date_columns:
+                df[col] = pd.to_datetime(df[col], format='%b-%y', errors='coerce')
+            
+            ## hitung time difference antara issue date dgn earliest credit line
+            df['months_since_earliest_cr_line'] = (df['issue_d'].dt.year - df['earliest_cr_line'].dt.year) * 12 + \
+                                                (df['issue_d'].dt.month - df['earliest_cr_line'].dt.month)
+            
+            ## hitung time difference antara last payment date dng issue date
+            df['months_since_issue_d_last_pymnt_d'] = (df['last_pymnt_d'].dt.year - df['issue_d'].dt.year) * 12 + \
+                                                    (df['last_pymnt_d'].dt.month - df['issue_d'].dt.month)
+            
+            ## hitung time difference antara last credit pull date and last payment date
+            df['months_since_last_pymnt_d_last_credit_pull_d'] = (df['last_credit_pull_d'].dt.year - df['last_pymnt_d'].dt.year) * 12 + \
+                                                                (df['last_credit_pull_d'].dt.month - df['last_pymnt_d'].dt.month)
+            
+            ## hitung time difference antara issue date and last credit pull date
+            df['months_since_issue_d_last_credit_pull_d'] = (df['last_credit_pull_d'].dt.year - df['issue_d'].dt.year) * 12 + \
+                                                            (df['last_credit_pull_d'].dt.month - df['issue_d'].dt.month)
+
+            ## drop kolom original
+            df.drop(columns=date_columns, inplace=True)
+            
+            return df
+
+        ## apply function
+        train_test_set = convert_and_calc_moths(train_test_set)
+
+        ## log dataframe
+        context.log.info("train-test shape: %s", train_test_set.shape)
+        context.log.info("first five rows: \n%s", train_test_set.head())
+
+        ## materialisasi schema
+        columns = [
+            TableColumn(name=col, type=str(train_test_set[col].dtype),
+                        description=f"Sample value: {train_test_set[col].iloc[33]}")
+            for col in train_test_set.columns
+        ]
+
+        n_rows = train_test_set.shape[0]
+        n_cols = train_test_set.shape[1]
+
+        yield MaterializeResult(
+                metadata={
+                    "dagster/column_schema": TableSchema(columns=columns),
+                    "dagster/type": "pandas-dataframe",
+                    "dagster/column_count": n_cols,
+                    "dagster/row_count": n_rows
+                }
+            )
+        
+        return train_test_set.to_csv("./data/outputs/prep-train-test-set.csv", index=False)
+
+    except Exception as e:
+        context.log.error("An error occurred while build database connection/load credit application table: %s", str(e))
+        raise e
 
 ## ===============  initial filter features =============== 
 ## --------- filter based on iv dan chi2 p-value dari setiap fiturnya ---------
 @multi_asset(
-    deps=["train_test_set"],
+    deps=["prepared_train_test"],
     outs={
         "filtered_by_iv": AssetOut(
             description="filtered train-test set based on information value dan chi2 p-value.",
@@ -102,7 +216,7 @@ def train_test_set(context):
 )
 def significant_features(context):
     try: 
-        train_data_df = pd.read_csv("./data/outputs/train-test-set.csv")
+        train_data_df = pd.read_csv("./data/outputs/prep-train-test-set.csv")
         applications = train_data_df.copy()
         feature_names = list(applications.columns[2:]) # exclude id dan credit event
         X = applications[feature_names]
@@ -117,17 +231,20 @@ def significant_features(context):
         dichotomic_feats = [col for col in applications.columns if col != 'credit_event' and is_dichotomic(applications[col])]
 
         ## define selection criteria
-        selection_criteria = {
-            "iv":{"min": 0.03, "max":0.7}, # information value, semakin tinggi iv mengindikasikan better predictive power. 
-            # "js":{"min":0.02},# jensen-shannon divergence, semakin tinggi js values mengindikasikan fitur memiliki discriminative power yg baik.
-            # "gini":{"min":0.02}, # semakin tinggi gini values mengindikasikan model discrimination yg lebih baik
-            # "quality_score":{"min": 0.01}, # custom metric dari optbinning
-        }
+        # selection_criteria = {
+        #     "iv":{"min": 0.02}, # information value, semakin tinggi iv mengindikasikan better predictive power. 
+        #     # "js":{"min":0.02},# jensen-shannon divergence, semakin tinggi js values mengindikasikan fitur memiliki discriminative power yg baik.
+        #     # "gini":{"min":0.02}, # semakin tinggi gini values mengindikasikan model discrimination yg lebih baik
+        #     # "quality_score":{"min": 0.01}, # custom metric dari optbinning
+        # }
 
         ## fit binningprocess
+        # binning_process = BinningProcess(feature_names,
+        #                                 categorical_variables=dichotomic_feats,
+        #                                 selection_criteria=selection_criteria)
         binning_process = BinningProcess(feature_names,
-                                        categorical_variables=dichotomic_feats,
-                                        selection_criteria=selection_criteria)
+                                categorical_variables=dichotomic_feats)
+
         binning_process.fit(X, y)
 
         ## build summary table
@@ -481,8 +598,8 @@ def mlflow_rf_model():
             feature_importance_df = pd.DataFrame({'Feature': X.columns, 'Importance': importances})
             feature_importance_df = feature_importance_df.sort_values(by='Importance', ascending=False)
 
-            ## ambil top N features, seenggaknya 50% dari jumlah original features
-            num_features_to_select = int(0.5 * len(X.columns))
+            ## ambil top N features, seenggaknya 80% dari jumlah original features karena jumlah fitur dari multicollinearity filter udah sedikti
+            num_features_to_select = int(0.8 * len(X.columns))
             top_features = feature_importance_df['Feature'][:num_features_to_select].values.tolist()  # Convert to list
 
             ## log selected features
@@ -511,6 +628,10 @@ def mlflow_rf_model():
             ## log model
             mlflow.sklearn.log_model(best_rf, "random_forest_model")
 
+            ## register model
+            model_uri = f"runs:/{run.info.run_id}/random_forest_model"
+            registered_model = mlflow.register_model(model_uri=model_uri, name="BestRandomForestModel")
+
             ## log feature importance plot
             plt.figure(figsize=(10, 10))
             feature_importance_df[:num_features_to_select].plot(x='Feature', y='Importance', kind='bar')
@@ -519,7 +640,7 @@ def mlflow_rf_model():
             mlflow.log_figure(plt.gcf(), "feature_importances.png")
             plt.close()
 
-        # return run ID dan selected features untuk downstream assets
+        ## return run ID dan selected features untuk downstream assets
         return Output(
             value={"run_id": run.info.run_id, "selected_features": top_features},
             metadata={
@@ -527,6 +648,7 @@ def mlflow_rf_model():
                 "num_selected_features": len(top_features),
                 "selected_features":top_features,
                 # "best_score": best_score,
+                "registered_model_version": registered_model.version,
                 "mlflow_tracking_uri": "run: 'mlflow ui --backend-store-uri sqlite:///mlflow.db', then go to http://127.0.0.1:5000"
             }
         )
@@ -549,7 +671,7 @@ def selected_features_data(context, mlflow_rf_model):
         # load transformed woe dataframe
         df = pd.read_csv("./data/outputs/applications-final-filter.csv")
         selected_features = mlflow_rf_model["selected_features"]
-        selected_features.extend(["id", "credit_event"])
+        selected_features.extend(["credit_event"])
 
         selected_features_df = df[selected_features]
         
@@ -560,7 +682,7 @@ def selected_features_data(context, mlflow_rf_model):
         filtered_columns = [
             TableColumn(
                 name=col,
-                type=str(selected_features_df[col].dtype),
+                type=str(selected_features_df[col].dtypes),
                 description=f"Sample value: {selected_features_df[col].iloc[33]}"
             )
             for col in selected_features_df.columns
@@ -584,20 +706,132 @@ def selected_features_data(context, mlflow_rf_model):
     
 
 # --------- model exprimentation ---------
-import logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+# @asset(
+#     group_name="credit_model_training"
+# )
 @asset(
-    group_name="credit_model_training"
+    deps=["selected_features_data"],
+    # ins={"mlflow_rf_model": AssetIn(key="mlflow_rf_model")},
+    group_name="credit_model_training",
+    code_version="0.1",
+    tags={"asset_type": "ml-model"},
+    owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
+    compute_kind="scikit-learn"
 )
-def credit_model(selected_features_data):
+def mlflow_credit_model(context):
     """
         deskripsi asset
     """
     try:
-        empty_list = []
-        return empty_list
+        ## load data
+        df = pd.read_csv("./data/outputs/application_selected_features.csv")
+        
+        ## prep features dan target
+        feature_names = list(df.copy().drop(labels=["credit_event", "id"], axis=1).columns)
+        X = df[feature_names]
+        y = df["credit_event"].values
+
+        ## splitting
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=666, stratify=y
+        )
+
+        binning_process = BinningProcess(feature_names)
+        pipeline = Pipeline(steps=[
+            ("binning_process", binning_process),
+            ("estimator", LogisticRegression(random_state=666))
+        ])
+
+        param_grid = {
+            'estimator__penalty': ['l1', 'l2', 'none'],
+            'estimator__C': [0.01, 0.1, 1, 10],
+            'estimator__class_weight': ['balanced'],
+            'estimator__solver': ['liblinear', 'saga'],
+        }
+
+        param_search = GridSearchCV(
+            estimator=pipeline,
+            param_grid=param_grid,
+            cv=5,
+            scoring="roc_auc"
+        )
+
+        mlflow.set_experiment("credit-model-logreg")
+
+        ## run experiment
+        with mlflow.start_run() as run:
+            mlflow.set_tag("use_case", "credit_scorecard")
+            mlflow.set_tag("dagster_zone", "credit_model_training")
+
+            ## fit model
+            param_search.fit(X_train, y_train)
+
+            ## log setiap parameter dan masing-masing scorenya
+            for i in range(len(param_search.cv_results_["params"])):
+                params = param_search.cv_results_["params"][i]
+                score = param_search.cv_results_["mean_test_score"][i]
+                mlflow.log_param(f"Params_{i}", params)
+                mlflow.log_metric(f"Score_{i}", score)
+
+            ## log parameter dan score terbaik
+            best_params = param_search.best_params_
+            best_score = float(param_search.best_score_)
+            mlflow.log_params(best_params)
+            mlflow.log_metric("Best_Score", best_score)
+
+            ## extract estimator
+            best_logreg = param_search.best_estimator_
+
+            ## extract coefficients
+            coefs = param_search.best_estimator_.named_steps.estimator.coef_
+            coefs_df = pd.DataFrame(zip(feature_names, coefs))
+
+            ## eval, predict di test data
+            y_pred = best_logreg.predict(X_test)
+            report = classification_report(y_test, y_pred)
+            mlflow.log_text(report, "classification_report.txt")
+
+            ## confusion matrix
+            plt.figure(figsize=(10,10))
+            cm = confusion_matrix(y_test, y_pred)
+            disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+            disp.plot()
+            plt.title("Best LogReg's Confusion Matrix on Test Data")
+            mlflow.log_figure(plt.gcf(), "confusion_matrix.png")
+
+            ## log model
+            mlflow.sklearn.log_model(best_logreg, "trained_credit_logreg")
+
+            ## register
+            model_uri = f"runs:/{run.info.run_id}/trained_credit_logreg"
+            register_model = mlflow.register_model(model_uri=model_uri, name="BestLogRegModel")
+        
+            ## log input
+            # mlflow.log_input(df, context="training")
+
+            ## materialisasi koefisien df
+            ## TODO: transpose coefs_df dulu lalu materialize 
+
+        return Output(
+            value={"run_id":run.info.run_id},
+            metadata={
+                "coefficients":coefs_df,
+                "registered_model_version": register_model.version,
+                "mlflow_tracking_uri": "run: 'mlflow ui --backend-store-uri sqlite:///mlflow.db', then go to http://127.0.0.1:5000"
+            }
+        )
+
+        # return Output(
+        #     value={"run_id": run.info.run_id, "selected_features": top_features},
+        #     metadata={
+        #         "run_id": run.info.run_id,
+        #         "num_selected_features": len(top_features),
+        #         "selected_features":top_features,
+        #         # "best_score": best_score,
+        #         "registered_model_version": registered_model.version,
+        #         "mlflow_tracking_uri": "run: 'mlflow ui --backend-store-uri sqlite:///mlflow.db', then go to http://127.0.0.1:5000"
+        #     }
+        # )
     
     except Exception as e:
         logger.error("An error occurred while filtering highly correlated features: %s", str(e))
@@ -606,7 +840,7 @@ def credit_model(selected_features_data):
 @asset(
     group_name="credit_model_training"
 )
-def model_coefficients(credit_model):
+def model_coefficients(mlflow_credit_model):
     """
         deskripsi asset
     """
