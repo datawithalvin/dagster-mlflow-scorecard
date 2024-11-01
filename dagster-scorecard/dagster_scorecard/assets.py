@@ -25,10 +25,6 @@ from sklearn.feature_selection import chi2, SelectFromModel
 import matplotlib.pyplot as plt
 
 import mlflow
-from mlflow.tracking import MlflowClient
-import mlflow.sklearn
-from mlflow.models import infer_signature
-from mlflow.data.pandas_dataset import PandasDataset
 
 
 # --------- konfigurasi ---------
@@ -46,19 +42,19 @@ mlflow.set_tracking_uri(mlflow_tracking_uri)
     code_version="0.1",
     owners=["alvinnoza.data@gmail.com", "team:Data Scientist"],
     compute_kind="duckdb",
-    description="Load train-test table to pandas dataframe"
+    description="Load train-test table ke pandas dataframe"
 )
 def train_test_set(context):
     try:
         """
-            Load train-test set dari table
+            Load dataset `train-test` dari SQL table yang sudah disiapkan sebelumnya.
+            Output dari asset ini berupa CSV dan disimpan sementara ke dalam `./data/outputs/train-test-set.csv` yg nantinya akan kita gunakan untuk downstream assets lainnya.
         """
         ## load data
         query = """SELECT * FROM train_test_set"""
         conn = duckdb.connect(os.getenv("DUCKDB_DATABASE"))
         train_test_set = conn.execute(query).fetch_df()
         train_test_set.drop_duplicates(subset=['id'], keep='first', inplace=True, ignore_index=True)
-
 
         ## log dataframe
         context.log.info("train-test shape: %s", train_test_set.shape)
@@ -98,12 +94,13 @@ def train_test_set(context):
     code_version="0.1",
     owners=["alvinnoza.data@gmail.com", "team:Data Scientist"],
     compute_kind="pandas",
-    description="Train-test set yang sudah dicleaning dan ditransformasi"
+    description="Prepare train-test set"
 )
 def prepared_train_test(context):
     try:
         """
-            Train-test set yang sudah dicleaning dan ditransformasi
+            Asset ini menghasilkan train-test set yang sudah diprepare sehingga dapat diconsume untuk steps selanjutnya.
+            Adapun beberapa preparation yang dilakukan adalah cleaning, handle missing values, typecasting, dan ekstrak informasi dari time-related features.
         """
         ## load data
         train_test_set = pd.read_csv("./data/outputs/train-test-set.csv")
@@ -199,13 +196,13 @@ def prepared_train_test(context):
     deps=["prepared_train_test"],
     outs={
         "filtered_by_iv": AssetOut(
-            description="filtered train-test set based on information value dan chi2 p-value.",
+            description="Filtered train-test set based on information value dan chi2 p-value.",
             code_version="0.1",
             tags={"asset_type":"pandas-dataframe"},
             owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
         ), 
         "iv_dict": AssetOut(
-            description="dictionary pairs antara signifikan fitur dengan information valuenya.",
+            description="Dictionary pairs antara signifikan features dengan information valuenya.",
             code_version="0.1",
             tags={"asset_type":"python-dictionary"},
             owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
@@ -215,6 +212,13 @@ def prepared_train_test(context):
     compute_kind="pandas"
 )
 def significant_features(context):
+    """
+    Fungsi ini menghasilkan output dua asset; `filtered_by_iv` dan `iv_dict`.
+    Untuk menghitung information values, kita memanfaatkan package `optbinning` dan melakukan test chi-square.
+    Information values digunakan untuk mengukur seberapa bagus sebuah fitur bisa memisahkan kreditur yg masuk ke kelas bad ataupun good.
+    Chi-square test dilakukan sehingga kita bisa melihat hubungan significant antara fitur terhadap credit envent.
+    Features yang ada kemudian difilter dan kita exclude fitur-fitur yang tidak dual-selection criteria.
+    """
     try: 
         train_data_df = pd.read_csv("./data/outputs/prep-train-test-set.csv")
         applications = train_data_df.copy()
@@ -347,11 +351,13 @@ def significant_features(context):
     code_version="0.1",
     tags={"asset_type":"pandas-dataframe"},
     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
-    compute_kind="pandas"
+    compute_kind="pandas",
+    description="Multicollinearity control"
 )
 def filtered_by_multicollinearity(context):
     """
-    filter out highly correlated features (>0.8) 
+    Filter multicollinearity. Kenapa penting? Karena multicollinearity bisa lead to UNSTABLE coefficient estimates di dalam credit model nantinya.
+    Terlebih karena nantinya kita menggunakan model logistic regression, kontrol multicollinearity juga penting untuk menghindari variance inflation di dalam prediksi model.
     """
     try:
         ## load iv dan dataset yg fiturnya sudah difilter
@@ -362,19 +368,20 @@ def filtered_by_multicollinearity(context):
         initial_filtered = initial_filtered_set.copy()
         initial_filtered.set_index(keys="id", drop=True, inplace=True)
 
+        ## include numerical features aja, yg object kita exclude
         exclude_cols = list(initial_filtered.select_dtypes(include=["object"]).columns)
         exclude_cols.extend(["credit_event"])
 
         applications_num_features = initial_filtered.drop(exclude_cols, axis=1)
 
-        ## compute correlation matrix
+        ## compute dan anlisis correlation
         correlation_matrix = applications_num_features.corr(method="pearson") ## <-- pakai pearson karena butuh measures linear relationship
         columns = correlation_matrix.columns
         high_corr_list = []
         threshold = 0.8
 
-        # pairwise correlations
-        # cari pasangan fitur dengan korelasi yang tinggi antar fitur tersebut
+        ## pairwise correlations
+        ## cari pasangan fitur dengan korelasi yang tinggi antar fitur tersebut
         for i in range(len(columns) - 1):
             for j in range(i + 1, len(columns)):
                 if abs(correlation_matrix.iloc[i, j]) > threshold:
@@ -393,6 +400,7 @@ def filtered_by_multicollinearity(context):
         # high_corr_pairs.columns = ['x', 'y', 'correlation']
         # high_corr_pairs = high_corr_pairs.drop_duplicates()
 
+        ## seleksi features
         ## flagging fitur yang harus diremove based on komparasi nilai iv-nya
         var_to_remove = []
         for _, row in high_corr_pairs.iterrows():
@@ -411,6 +419,10 @@ def filtered_by_multicollinearity(context):
         
         ## log
         context.log.info("final filtered applications: \n%s", final_applications_features_filtered.head())
+
+        ## check jumlah feature
+        if len(final_applications_features_filtered.columns) < 5:
+            context.log.warning("Very few features remaining after filtering!")
 
         filtered_columns = [
             TableColumn(name=col, 
@@ -510,11 +522,15 @@ def filtered_by_multicollinearity(context):
     code_version="0.1",
     tags={"asset_type":"ml-model"},
     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
-    compute_kind="scikitlearn"
+    compute_kind="scikitlearn",
+    description="RF model untuk more features selection"
 )
 def mlflow_rf_model():
     """
+    Asset MLflow untuk feature selection dengan RandomForest.
     Random Forest model for feature selection using MLflow for experiment tracking.
+    RF model bisa capture non-linear feature importance dan interaction effects.
+    Kita akan keep 80% features.
     """
     try:
         ## load data 
@@ -552,6 +568,8 @@ def mlflow_rf_model():
         y = transformed_applications["credit_event"].values
 
         ## split
+        ## TODO: POTENTIAL LEAKAGE DISINI
+        ## JANGAN PAKAI TRANSFORMED_DATA UNTUK SPLIT KE TRAIN-TEST
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=777)
 
         ## init classifier
@@ -706,9 +724,7 @@ def selected_features_data(context, mlflow_rf_model):
     
 
 # --------- model exprimentation ---------
-# @asset(
-#     group_name="credit_model_training"
-# )
+
 @asset(
     deps=["selected_features_data"],
     # ins={"mlflow_rf_model": AssetIn(key="mlflow_rf_model")},
@@ -820,18 +836,6 @@ def mlflow_credit_model(context):
                 "mlflow_tracking_uri": "run: 'mlflow ui --backend-store-uri sqlite:///mlflow.db', then go to http://127.0.0.1:5000"
             }
         )
-
-        # return Output(
-        #     value={"run_id": run.info.run_id, "selected_features": top_features},
-        #     metadata={
-        #         "run_id": run.info.run_id,
-        #         "num_selected_features": len(top_features),
-        #         "selected_features":top_features,
-        #         # "best_score": best_score,
-        #         "registered_model_version": registered_model.version,
-        #         "mlflow_tracking_uri": "run: 'mlflow ui --backend-store-uri sqlite:///mlflow.db', then go to http://127.0.0.1:5000"
-        #     }
-        # )
     
     except Exception as e:
         logger.error("An error occurred while filtering highly correlated features: %s", str(e))
@@ -842,7 +846,7 @@ def mlflow_credit_model(context):
 )
 def model_coefficients(mlflow_credit_model):
     """
-        deskripsi asset
+        coeffients dari registered logistic regression model untuk membentuk scorecard
     """
     try:
         empty_list = []
@@ -858,7 +862,7 @@ def model_coefficients(mlflow_credit_model):
 )
 def score_card(model_coefficients):
     """
-        deskripsi asset
+        credit scorecard 
     """
     try:
         empty_list = []
