@@ -17,7 +17,7 @@ from optbinning import BinningProcess
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import auc, roc_auc_score, roc_curve, classification_report, ConfusionMatrixDisplay, confusion_matrix
-from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder
 from sklearn.feature_selection import chi2, SelectFromModel
@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 
 import mlflow
 
+from . procedures import calc_credit_metrics
 
 # --------- konfigurasi ---------
 logging.basicConfig(level=logging.INFO)
@@ -466,9 +467,9 @@ def filtered_by_multicollinearity(context):
 #     """
 #     try:
 #         applications = pd.read_csv("./data/outputs/applications-final-filter.csv")
-#         variable_names = list(applications.columns[:-2]) # exclude id dan credit event
+#         feature_names = list(applications.columns[:-2]) # exclude id dan credit event
 
-#         X = applications[variable_names]
+#         X = applications[feature_names]
 #         y = applications["credit_event"].values
 
 #         def is_dichotomic(column):
@@ -477,7 +478,7 @@ def filtered_by_multicollinearity(context):
 
 #         dichotomic_feats = [col for col in applications.columns if col != 'credit_event' and is_dichotomic(applications[col])]
 
-#         binning_process = BinningProcess(variable_names, categorical_variables=dichotomic_feats)
+#         binning_process = BinningProcess(feature_names, categorical_variables=dichotomic_feats)
 #         binning_process.fit(X, y)
 
 #         summary_table = binning_process.summary()
@@ -519,23 +520,23 @@ def filtered_by_multicollinearity(context):
 @asset(
     deps=["filtered_by_multicollinearity"],
     group_name="feature_selection",
-    code_version="0.1",
+    code_version="0.2",
     tags={"asset_type":"ml-model"},
     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
     compute_kind="scikitlearn",
     description="RF model untuk more features selection"
 )
-def mlflow_rf_model():
+def mlflow_rf_model(context):
     """
     Asset MLflow untuk feature selection dengan RandomForest.
     Random Forest model for feature selection using MLflow for experiment tracking.
     RF model bisa capture non-linear feature importance dan interaction effects.
-    Kita akan keep 80% features.
+    Kita akan keep 80% original features.
     """
     try:
         ## load data 
         df = pd.read_csv("./data/outputs/applications-final-filter.csv")
-        df.set_index("id", inplace=True)
+        # df.set_index("id", inplace=True)
 
         def is_dichotomic(column):
                     import numpy as np
@@ -543,47 +544,50 @@ def mlflow_rf_model():
                     return len(unique_values) == 2 and np.issubdtype(unique_values.dtype, np.integer)
 
         ## baseline
-        variable_names = list(df.copy().drop(labels=["credit_event"], axis=1).columns) ## <-- exclude credit event
-        X = df[variable_names]
+        feature_names = list(df.copy().drop(labels=["credit_event", "id"], axis=1).columns) ## <-- exclude credit event
+        X = df[feature_names]
         y = df["credit_event"].values
 
         dichotomic_feats = [col for col in df.columns if col != 'credit_event' and is_dichotomic(df[col])]
         
+        ## spliting
+        X_train_val, X_holdout, y_train_val, y_holdout = train_test_split(
+            X, y, test_size=0.2, 
+            random_state=777, 
+            stratify=y
+        )
+
         ## binning
-        binning_process = BinningProcess(variable_names,
-                                categorical_variables=dichotomic_feats)
-        binning_process.fit(X, y)
-
-        ## transform menjadi bin
-        transformed_table = binning_process.fit_transform(X, y, metric="woe", check_input=True).reset_index(drop=False)
-
-        to_merge = df[["credit_event"]].reset_index(drop=False)
-        to_merge.drop_duplicates(subset=['id'], keep='last', inplace=True, ignore_index=True)
-        transformed_applications = pd.merge(transformed_table, to_merge, left_on="id", right_on="id", how="inner") ## <-- merge by id
-        transformed_applications.drop_duplicates(subset=['id'], keep='last', inplace=True, ignore_index=True)
-
-        ## training random forest dengan transformed data
-        variable_names = list(transformed_applications.copy().drop(labels=["credit_event"], axis=1).columns)
-        X = transformed_applications[variable_names]
-        y = transformed_applications["credit_event"].values
-
-        ## split
-        ## TODO: POTENTIAL LEAKAGE DISINI
-        ## JANGAN PAKAI TRANSFORMED_DATA UNTUK SPLIT KE TRAIN-TEST
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=777)
-
-        ## init classifier
+        binning_process = BinningProcess(feature_names, 
+                                         categorical_variables=dichotomic_feats)
+        pipeline = Pipeline(steps=[
+                    ("binning_process", binning_process),
+                    ("classifier", RandomForestClassifier(random_state=777))
+                ])
+        
         param_grid = {
-            'n_estimators': [100, 200, 300, 400],
-            'max_features': ['auto', 'sqrt', 'log2'],
-            'max_depth': [10, 20, 30],
-            'min_samples_split': [2, 5],
-            'min_samples_leaf': [1, 2],
-            'bootstrap': [True, False]
+            "classifier__n_estimators": [100, 200, 300, 400],
+            "classifier__max_features": ["sqrt", "log2"],
+            "classifier__max_depth": [10, 20, None],
+            "classifier__min_samples_split": [2, 5],
+            "classifier__min_samples_leaf": [1, 2, 4],
+            "classifier__bootstrap": [True],
+            "classifier__class_weight":["balanced", "balanced_subsample"]
         }
 
-        rf = RandomForestClassifier(random_state=777)
-        rf_random = RandomizedSearchCV(estimator=rf, param_distributions=param_grid, n_iter=10, cv=3, verbose=2, random_state=777, n_jobs=-1)
+        ## pakai stratified kfold supaya distribusi target tetap terjaga
+        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=777)
+
+        rf_random = RandomizedSearchCV(
+            estimator=pipeline, 
+            param_distributions=param_grid, 
+            n_iter=10, 
+            cv=cv, 
+            verbose=2, 
+            # random_state=777, 
+            # n_jobs=-1,
+            scoring="f1"
+        )
 
         mlflow.set_experiment("feature-selection-with-RF")
 
@@ -593,7 +597,7 @@ def mlflow_rf_model():
             mlflow.set_tag("dagster_zone", "feature_selection")
 
             ## fit model
-            rf_random.fit(X_train, y_train)
+            rf_random.fit(X_train_val, y_train_val)
 
             ## log setiap parameter dan masing-masing scorenya
             for i in range(len(rf_random.cv_results_['params'])):
@@ -612,31 +616,58 @@ def mlflow_rf_model():
             best_rf = rf_random.best_estimator_
 
             ## extract feature importances
-            importances = best_rf.feature_importances_
-            feature_importance_df = pd.DataFrame({'Feature': X.columns, 'Importance': importances})
+            importances = best_rf.named_steps['classifier'].feature_importances_
+            feature_names = X_train_val.columns.tolist()
+            # if 'id' in feature_names:
+            #     feature_names.remove('id')
+
+            feature_importance_df = pd.DataFrame({
+                'Feature': feature_names,
+                'Importance': importances
+            })
             feature_importance_df = feature_importance_df.sort_values(by='Importance', ascending=False)
 
             ## ambil top N features, seenggaknya 80% dari jumlah original features karena jumlah fitur dari multicollinearity filter udah sedikti
-            num_features_to_select = int(0.8 * len(X.columns))
+            num_features_to_select = int(0.8 * len(feature_names))
             top_features = feature_importance_df['Feature'][:num_features_to_select].values.tolist()  # Convert to list
 
             ## log selected features
             mlflow.log_param("Selected_Features", top_features)
 
-            ## filter dataset dengan selected features
-            X_train_selected = X_train[top_features]
-            X_test_selected = X_test[top_features]
+            # ## filter dataset dengan selected features
+            X_train_selected = X_train_val[top_features]
+            # X_test_selected = X_test[top_features]
 
-            ## retrain model dengan selected features
-            best_rf.fit(X_train_selected, y_train)
+            binning_process_sec = BinningProcess(top_features)
+            selected_rf = Pipeline([
+                ("binning_process", binning_process_sec),
+                ("classifier", RandomForestClassifier(**best_rf.named_steps['classifier'].get_params()))
+            ])
 
-            ## eval model
-            y_pred = best_rf.predict(X_test_selected)
-            report = classification_report(y_test, y_pred)
+            ## re-train model
+            selected_rf.fit(X_train_selected, y_train_val)
+
+            ## predict dan eval model
+            y_pred = selected_rf.predict(X_holdout[top_features])
+            y_prob = selected_rf.predict_proba(X_holdout[top_features])[:, 1]
+
+            ## calculate metrics
+            credit_metrics = calc_credit_metrics(y_holdout, y_pred, y_prob)
+            for metric_name, metric_value in credit_metrics.items():
+                    mlflow.log_metric(metric_name, metric_value)
+
+            if credit_metrics['gini_coefficient'] < 0.3:
+                context.log.warning(f"Low Gini coefficient: {credit_metrics['gini_coefficient']:.3f}")
+            if credit_metrics['ks_statistic'] < 0.3:
+                context.log.warning(f"Low KS statistic: {credit_metrics['ks_statistic']:.3f}")
+
+
+            ## log classification report 
+            report = classification_report(y_holdout, y_pred)
             mlflow.log_text(report, "classification_report.txt")
 
             ## log confusion matrix
-            cm = confusion_matrix(y_test, y_pred)
+            cm = confusion_matrix(y_holdout, y_pred)
             disp = ConfusionMatrixDisplay(confusion_matrix=cm)
             disp.plot()
             plt.title('Confusion Matrix')
@@ -644,7 +675,7 @@ def mlflow_rf_model():
             plt.close()
 
             ## log model
-            mlflow.sklearn.log_model(best_rf, "random_forest_model")
+            mlflow.sklearn.log_model(selected_rf, "random_forest_model")
 
             ## register model
             model_uri = f"runs:/{run.info.run_id}/random_forest_model"
@@ -665,6 +696,10 @@ def mlflow_rf_model():
                 "run_id": run.info.run_id,
                 "num_selected_features": len(top_features),
                 "selected_features":top_features,
+                "gini_coefficient": float(credit_metrics['gini_coefficient']),
+                "ks_statistic": float(credit_metrics['ks_statistic']),
+                "precision_bad_rate": float(credit_metrics['precision_bad_rate']),
+                "recall_bad_rate": float(credit_metrics['recall_bad_rate']),
                 # "best_score": best_score,
                 "registered_model_version": registered_model.version,
                 "mlflow_tracking_uri": "run: 'mlflow ui --backend-store-uri sqlite:///mlflow.db', then go to http://127.0.0.1:5000"
@@ -673,7 +708,9 @@ def mlflow_rf_model():
 
     except Exception as e:
         raise RuntimeError(f"An error occurred during Random Forest feature selection: {str(e)}")
-    
+
+
+
 ## ----------------- feature selection ------------------
 @asset(
     deps=["filtered_by_multicollinearity"],
@@ -682,7 +719,8 @@ def mlflow_rf_model():
     code_version="0.1",
     tags={"asset_type": "pandas-dataframe"},
     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
-    compute_kind="pandas"
+    compute_kind="pandas",
+    description=""
 )
 def selected_features_data(context, mlflow_rf_model):
     try:
