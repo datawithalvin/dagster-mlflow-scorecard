@@ -1,4 +1,4 @@
-## =============== import package =============== 
+## =============== IMPORT PACKAGE =============== 
 import pandas as pd
 import numpy as np
 import duckdb
@@ -13,29 +13,31 @@ from dagster import (
 )
 
 from optbinning import BinningProcess
+from optbinning.scorecard import Scorecard, plot_auc_roc, plot_cap, plot_ks
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import auc, roc_auc_score, roc_curve, classification_report, ConfusionMatrixDisplay, confusion_matrix
+from sklearn.metrics import precision_score, recall_score, roc_auc_score, classification_report, ConfusionMatrixDisplay, confusion_matrix
 from sklearn.model_selection import train_test_split, RandomizedSearchCV, GridSearchCV, StratifiedKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder
-from sklearn.feature_selection import chi2, SelectFromModel
+from sklearn.feature_selection import chi2
 
 import matplotlib.pyplot as plt
 
 import mlflow
+from mlflow.models import infer_signature
 
-from . procedures import calc_credit_metrics
+from . procedures import calc_credit_metrics, is_dichotomic
 
-# --------- konfigurasi ---------
+# =============== CONFIG =============== 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 mlflow_tracking_uri = f"sqlite:///{os.path.join(os.getcwd(), 'mlflow.db')}"
 mlflow.set_tracking_uri(mlflow_tracking_uri)
 
-## =============== prep =============== 
+## =============== ASET2 INITIAL PREP =============== 
 @asset(
     group_name="initial_prep",
     tags={"asset_type":"DuckDBResource", 
@@ -191,8 +193,7 @@ def prepared_train_test(context):
         context.log.error("An error occurred while build database connection/load credit application table: %s", str(e))
         raise e
 
-## ===============  initial filter features =============== 
-## --------- filter based on iv dan chi2 p-value dari setiap fiturnya ---------
+## =============== ASET2 FILTER FEATURES =============== 
 @multi_asset(
     deps=["prepared_train_test"],
     outs={
@@ -227,32 +228,16 @@ def significant_features(context):
         X = applications[feature_names]
         y = applications["credit_event"].values
 
-        def is_dichotomic(column):
-            unique_values = column.dropna().unique()
-            return len(unique_values) == 2 and np.issubdtype(unique_values.dtype, np.integer)
-
-
         ## cek fitur-fitur dengan numerical values bersifat dichotomic (binary)
         dichotomic_feats = [col for col in applications.columns if col != 'credit_event' and is_dichotomic(applications[col])]
 
-        ## define selection criteria
-        # selection_criteria = {
-        #     "iv":{"min": 0.02}, # information value, semakin tinggi iv mengindikasikan better predictive power. 
-        #     # "js":{"min":0.02},# jensen-shannon divergence, semakin tinggi js values mengindikasikan fitur memiliki discriminative power yg baik.
-        #     # "gini":{"min":0.02}, # semakin tinggi gini values mengindikasikan model discrimination yg lebih baik
-        #     # "quality_score":{"min": 0.01}, # custom metric dari optbinning
-        # }
-
-        ## fit binningprocess
-        # binning_process = BinningProcess(feature_names,
-        #                                 categorical_variables=dichotomic_feats,
-        #                                 selection_criteria=selection_criteria)
+        ## fit proses binning
         binning_process = BinningProcess(feature_names,
                                 categorical_variables=dichotomic_feats)
 
         binning_process.fit(X, y)
 
-        ## build summary table
+        ## transform ke summary table
         summary_table = binning_process.summary()
         summary_table.sort_values(by="iv", ascending=False, inplace=True)
 
@@ -345,7 +330,6 @@ def significant_features(context):
         context.log.error(f"An error occurred while filtering significant features: {str(e)}")
         raise e
     
-# --------- filter multicollinearity features ---------
 @asset(
     deps=["filtered_by_iv", "iv_dict"],
     group_name="feature_filtering",
@@ -389,17 +373,6 @@ def filtered_by_multicollinearity(context):
                     high_corr_list.append({"x": [columns[i]], "y": [columns[j]]})
 
         high_corr_pairs = pd.DataFrame(high_corr_list)
-
-        ## compute correlation matrix
-        ## cek pairwise correlations
-        # correlation_matrix = applications_num_features.corr(method="pearson") ## <-- pakai pearson karena butuh measures linear relationship
-        # threshold = 0.8
-
-        # corr_pairs = correlation_matrix.abs().unstack()
-        # high_corr = corr_pairs[(corr_pairs > threshold) & (corr_pairs < 1)]
-        # high_corr_pairs = high_corr.reset_index()
-        # high_corr_pairs.columns = ['x', 'y', 'correlation']
-        # high_corr_pairs = high_corr_pairs.drop_duplicates()
 
         ## seleksi features
         ## flagging fitur yang harus diremove based on komparasi nilai iv-nya
@@ -451,72 +424,7 @@ def filtered_by_multicollinearity(context):
         context.log.error("An error occurred while filtering highly correlated features: %s", str(e))
         raise e
     
-
-# --------- feature selection zone ---------
-# @asset(
-#     deps=["filtered_by_multicollinearity"],
-#     group_name="feature_selection",
-#     code_version="0.1",
-#     tags={"asset_type":"pandas-dataframe"},
-#     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
-#     compute_kind="pandas"
-# )
-# def transformed_applications(context):
-#     """
-#         transformed values ke woe per karakteristik fitur
-#     """
-#     try:
-#         applications = pd.read_csv("./data/outputs/applications-final-filter.csv")
-#         feature_names = list(applications.columns[:-2]) # exclude id dan credit event
-
-#         X = applications[feature_names]
-#         y = applications["credit_event"].values
-
-#         def is_dichotomic(column):
-#             unique_values = column.dropna().unique()
-#             return len(unique_values) == 2 and np.issubdtype(unique_values.dtype, np.integer)
-
-#         dichotomic_feats = [col for col in applications.columns if col != 'credit_event' and is_dichotomic(applications[col])]
-
-#         binning_process = BinningProcess(feature_names, categorical_variables=dichotomic_feats)
-#         binning_process.fit(X, y)
-
-#         summary_table = binning_process.summary()
-#         summary_table.sort_values(by="iv", ascending=False, inplace=True)
-#         transformed_table = binning_process.fit_transform(X, y, metric="woe", check_input=True)
-
-#         merged_by_index = pd.merge(transformed_table, applications[["id", "credit_event"]], left_index=True, right_index=True)
-
-#         # log the head of the final filtered dataframe
-#         context.log.info("transformed applications: \n%s", merged_by_index.head())
-
-#         filtered_shape = merged_by_index.shape
-
-#         filtered_columns = [
-#             TableColumn(
-#                 name=col,
-#                 type=str(merged_by_index[col].dtype),
-#                 description=f"Sample value: {merged_by_index[col].iloc[33]}"
-#             )
-#             for col in merged_by_index.columns
-#         ]
-
-#         yield MaterializeResult(
-#             asset_key="transformed_applications",
-#             metadata={
-#                 "dagster/column_schema": TableSchema(columns=filtered_columns),
-#                 "dagster/type": "pandas-dataframe",
-#                 "dagster/column_count": filtered_shape[1], 
-#                 "dagster/row_count": filtered_shape[0]
-#             }
-#         )
-
-#         return merged_by_index.to_csv("./data/outputs/transformed-applications.csv", index=False)
-    
-#     except Exception as e:
-#         context.log.error("An error occurred while filtering highly correlated features: %s", str(e))
-#         raise e
-
+## =============== ASET2 FEATURE SELECTION =============== 
 @asset(
     deps=["filtered_by_multicollinearity"],
     group_name="feature_selection",
@@ -524,7 +432,7 @@ def filtered_by_multicollinearity(context):
     tags={"asset_type":"ml-model"},
     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
     compute_kind="scikitlearn",
-    description="RF model untuk more features selection"
+    description="Feature selection dengan Random Forest"
 )
 def mlflow_rf_model(context):
     """
@@ -538,11 +446,6 @@ def mlflow_rf_model(context):
         df = pd.read_csv("./data/outputs/applications-final-filter.csv")
         # df.set_index("id", inplace=True)
 
-        def is_dichotomic(column):
-                    import numpy as np
-                    unique_values = column.dropna().unique()
-                    return len(unique_values) == 2 and np.issubdtype(unique_values.dtype, np.integer)
-
         ## baseline
         feature_names = list(df.copy().drop(labels=["credit_event", "id"], axis=1).columns) ## <-- exclude credit event
         X = df[feature_names]
@@ -552,7 +455,7 @@ def mlflow_rf_model(context):
         
         ## spliting
         X_train_val, X_holdout, y_train_val, y_holdout = train_test_split(
-            X, y, test_size=0.2, 
+            X, y, test_size=0.25, 
             random_state=777, 
             stratify=y
         )
@@ -565,39 +468,75 @@ def mlflow_rf_model(context):
                     ("classifier", RandomForestClassifier(random_state=777))
                 ])
         
-        param_grid = {
+        ## set model parameter
+        params = {
             "classifier__n_estimators": [100, 200, 300, 400],
-            "classifier__max_features": ["sqrt", "log2"],
+            "classifier__max_features": ["sqrt"],
             "classifier__max_depth": [10, 20, None],
-            "classifier__min_samples_split": [2, 5],
-            "classifier__min_samples_leaf": [1, 2, 4],
+            "classifier__min_samples_split": [5],
+            "classifier__min_samples_leaf": [2, 4],
             "classifier__bootstrap": [True],
-            "classifier__class_weight":["balanced", "balanced_subsample"]
+            "classifier__class_weight":["balanced"]
         }
 
         ## pakai stratified kfold supaya distribusi target tetap terjaga
-        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=777)
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=777)
 
         rf_random = RandomizedSearchCV(
             estimator=pipeline, 
-            param_distributions=param_grid, 
+            param_distributions=params, 
             n_iter=10, 
             cv=cv, 
             verbose=2, 
-            # random_state=777, 
+            random_state=777, 
             # n_jobs=-1,
-            scoring="f1"
+            scoring="roc_auc"
         )
+
+        ## train  model
+        rf_random.fit(X_train_val, y_train_val)
+
+        ## extract best parameter dan dan best score dari hasil cv
+        best_params = rf_random.best_params_
+        best_score = float(rf_random.best_score_)
+
+        ## extract estimator
+        best_rf = rf_random.best_estimator_
+
+        ## extract feature importances
+        importances = best_rf.named_steps['classifier'].feature_importances_
+        feature_names = X_train_val.columns.tolist()
+        feature_importance_df = pd.DataFrame({'Feature': feature_names,'Importance': importances}).sort_values(by='Importance', ascending=False)
+
+        ## ambil top N features, seenggaknya 80% dari jumlah original features karena output jumlah fitur dari multicollinearity filter udah cukup sedikit
+        num_features_to_select = int(0.8 * len(feature_names))
+        top_features = feature_importance_df['Feature'][:num_features_to_select].values.tolist()  ## convert ke list
+
+        ## filter dataset dengan selected features
+        X_train_selected = X_train_val[top_features]
+
+        ## binning dan training model ulang untuk cek performa pada features yg sudah difilter
+        binning_process_sec = BinningProcess(top_features)
+        selected_rf = Pipeline([
+            ("binning_process", binning_process_sec),
+            ("classifier", RandomForestClassifier(**best_rf.named_steps['classifier'].get_params()))
+        ])
+
+        ## re-train model
+        selected_rf.fit(X_train_selected, y_train_val)
+
+        ## predict dan eval model
+        y_pred = selected_rf.predict(X_holdout[top_features])
+        y_prob = selected_rf.predict_proba(X_holdout[top_features])[:, 1]
 
         mlflow.set_experiment("feature-selection-with-RF")
 
-        ## run experiment
+        ## log model, metadata, dan performance metricsnya ke mlflow
         with mlflow.start_run() as run:
+
+            ## set tag
             mlflow.set_tag("use_case", "credit_scorecard")
             mlflow.set_tag("dagster_zone", "feature_selection")
-
-            ## fit model
-            rf_random.fit(X_train_val, y_train_val)
 
             ## log setiap parameter dan masing-masing scorenya
             for i in range(len(rf_random.cv_results_['params'])):
@@ -607,51 +546,13 @@ def mlflow_rf_model(context):
                 mlflow.log_metric(f"Score_{i}", score)
 
             ## log parameter dan score terbaik
-            best_params = rf_random.best_params_
-            best_score = float(rf_random.best_score_)
             mlflow.log_params(best_params)
             mlflow.log_metric("Best_Score", best_score)
-
-            ## extract estimator
-            best_rf = rf_random.best_estimator_
-
-            ## extract feature importances
-            importances = best_rf.named_steps['classifier'].feature_importances_
-            feature_names = X_train_val.columns.tolist()
-            # if 'id' in feature_names:
-            #     feature_names.remove('id')
-
-            feature_importance_df = pd.DataFrame({
-                'Feature': feature_names,
-                'Importance': importances
-            })
-            feature_importance_df = feature_importance_df.sort_values(by='Importance', ascending=False)
-
-            ## ambil top N features, seenggaknya 80% dari jumlah original features karena jumlah fitur dari multicollinearity filter udah sedikti
-            num_features_to_select = int(0.8 * len(feature_names))
-            top_features = feature_importance_df['Feature'][:num_features_to_select].values.tolist()  # Convert to list
 
             ## log selected features
             mlflow.log_param("Selected_Features", top_features)
 
-            # ## filter dataset dengan selected features
-            X_train_selected = X_train_val[top_features]
-            # X_test_selected = X_test[top_features]
-
-            binning_process_sec = BinningProcess(top_features)
-            selected_rf = Pipeline([
-                ("binning_process", binning_process_sec),
-                ("classifier", RandomForestClassifier(**best_rf.named_steps['classifier'].get_params()))
-            ])
-
-            ## re-train model
-            selected_rf.fit(X_train_selected, y_train_val)
-
-            ## predict dan eval model
-            y_pred = selected_rf.predict(X_holdout[top_features])
-            y_prob = selected_rf.predict_proba(X_holdout[top_features])[:, 1]
-
-            ## calculate metrics
+            ## calculate & log performance metrics 
             credit_metrics = calc_credit_metrics(y_holdout, y_pred, y_prob)
             for metric_name, metric_value in credit_metrics.items():
                     mlflow.log_metric(metric_name, metric_value)
@@ -660,7 +561,6 @@ def mlflow_rf_model(context):
                 context.log.warning(f"Low Gini coefficient: {credit_metrics['gini_coefficient']:.3f}")
             if credit_metrics['ks_statistic'] < 0.3:
                 context.log.warning(f"Low KS statistic: {credit_metrics['ks_statistic']:.3f}")
-
 
             ## log classification report 
             report = classification_report(y_holdout, y_pred)
@@ -675,7 +575,15 @@ def mlflow_rf_model(context):
             plt.close()
 
             ## log model
-            mlflow.sklearn.log_model(selected_rf, "random_forest_model")
+            signature = infer_signature(X_train_selected, selected_rf.predict(X_train_selected))
+            # mlflow.sklearn.log_model(selected_rf, "random_forest_model")
+            mlflow.sklearn.log_model(
+                sk_model=selected_rf,
+                registered_model_name="random_forest_model",
+                input_example=X_train_selected,
+                signature=signature,
+                artifact_path="BestRandomForestModel"
+            )
 
             ## register model
             model_uri = f"runs:/{run.info.run_id}/random_forest_model"
@@ -693,11 +601,10 @@ def mlflow_rf_model(context):
         return Output(
             value={"run_id": run.info.run_id, "selected_features": top_features},
             metadata={
-                "run_id": run.info.run_id,
                 "num_selected_features": len(top_features),
                 "selected_features":top_features,
-                "gini_coefficient": float(credit_metrics['gini_coefficient']),
-                "ks_statistic": float(credit_metrics['ks_statistic']),
+                # "gini_coefficient": float(credit_metrics['gini_coefficient']),
+                # "ks_statistic": float(credit_metrics['ks_statistic']),
                 "precision_bad_rate": float(credit_metrics['precision_bad_rate']),
                 "recall_bad_rate": float(credit_metrics['recall_bad_rate']),
                 # "best_score": best_score,
@@ -710,8 +617,6 @@ def mlflow_rf_model(context):
         raise RuntimeError(f"An error occurred during Random Forest feature selection: {str(e)}")
 
 
-
-## ----------------- feature selection ------------------
 @asset(
     deps=["filtered_by_multicollinearity"],
     ins={"mlflow_rf_model": AssetIn(key="mlflow_rf_model")},
@@ -720,11 +625,14 @@ def mlflow_rf_model(context):
     tags={"asset_type": "pandas-dataframe"},
     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
     compute_kind="pandas",
-    description=""
+    description="Filtered train-test set based on feature selection"
 )
 def selected_features_data(context, mlflow_rf_model):
+    """
+        Filter by selected features.
+    """
     try:
-        # load transformed woe dataframe
+        ## load data, filter by selected features
         df = pd.read_csv("./data/outputs/applications-final-filter.csv")
         selected_features = mlflow_rf_model["selected_features"]
         selected_features.extend(["credit_event"])
@@ -761,33 +669,36 @@ def selected_features_data(context, mlflow_rf_model):
         raise e
     
 
-# --------- model exprimentation ---------
+## =============== ASET2 BUILD SCORECARD =============== 
 
 @asset(
     deps=["selected_features_data"],
     # ins={"mlflow_rf_model": AssetIn(key="mlflow_rf_model")},
-    group_name="credit_model_training",
+    group_name="build_scorecard",
     code_version="0.1",
     tags={"asset_type": "ml-model"},
     owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
-    compute_kind="scikit-learn"
+    compute_kind="scikit-learn",
+    description="Experiment Tracking LogReg Model di MLflow"
 )
 def mlflow_credit_model(context):
     """
-        deskripsi asset
+        Logistic Regression model untuk scorecard.
     """
     try:
         ## load data
         df = pd.read_csv("./data/outputs/application_selected_features.csv")
         
         ## prep features dan target
-        feature_names = list(df.copy().drop(labels=["credit_event", "id"], axis=1).columns)
+        feature_names = list(df.copy().drop(labels=["credit_event"], axis=1).columns)
         X = df[feature_names]
         y = df["credit_event"].values
 
         ## splitting
         X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=666, stratify=y
+            X, y, test_size=0.25, 
+            random_state=777, 
+            stratify=y
         )
 
         binning_process = BinningProcess(feature_names)
@@ -803,10 +714,13 @@ def mlflow_credit_model(context):
             'estimator__solver': ['liblinear', 'saga'],
         }
 
+        ## pakai stratified kfold supaya distribusi target tetap terjaga
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=777)
+
         param_search = GridSearchCV(
             estimator=pipeline,
             param_grid=param_grid,
-            cv=5,
+            cv=cv,
             scoring="roc_auc"
         )
 
@@ -837,13 +751,24 @@ def mlflow_credit_model(context):
             best_logreg = param_search.best_estimator_
 
             ## extract coefficients
-            coefs = param_search.best_estimator_.named_steps.estimator.coef_
-            coefs_df = pd.DataFrame(zip(feature_names, coefs))
+            # coefs = param_search.best_estimator_.named_steps.estimator.coef_
+            # coefs_df = pd.DataFrame(zip(feature_names, coefs))
 
+            # coefs_dict = {
+            # 'features': coefs_df['Feature'].tolist(),
+            # 'coefficients': coefs_df['Coefficient'].tolist()
+            # }
+                
             ## eval, predict di test data
             y_pred = best_logreg.predict(X_test)
+            y_proba = best_logreg.predict_proba(X_test)[:, 1]
             report = classification_report(y_test, y_pred)
             mlflow.log_text(report, "classification_report.txt")
+
+            ## eval metrics
+            roc_auc = roc_auc_score(y_test, y_proba)
+            precision = precision_score(y_test, y_pred)
+            recall = recall_score(y_test, y_pred)
 
             ## confusion matrix
             plt.figure(figsize=(10,10))
@@ -859,17 +784,16 @@ def mlflow_credit_model(context):
             ## register
             model_uri = f"runs:/{run.info.run_id}/trained_credit_logreg"
             register_model = mlflow.register_model(model_uri=model_uri, name="BestLogRegModel")
-        
-            ## log input
-            # mlflow.log_input(df, context="training")
-
-            ## materialisasi koefisien df
-            ## TODO: transpose coefs_df dulu lalu materialize 
 
         return Output(
             value={"run_id":run.info.run_id},
             metadata={
-                "coefficients":coefs_df,
+                # "coefficients":coefs_dict,
+                "roc-auc":float(roc_auc),
+                "precision":float(precision),
+                "recall":float(recall),
+                "best cv score":float(best_score),
+                "model parameters":best_params,
                 "registered_model_version": register_model.version,
                 "mlflow_tracking_uri": "run: 'mlflow ui --backend-store-uri sqlite:///mlflow.db', then go to http://127.0.0.1:5000"
             }
@@ -878,35 +802,127 @@ def mlflow_credit_model(context):
     except Exception as e:
         logger.error("An error occurred while filtering highly correlated features: %s", str(e))
         raise e
-    
-@asset(
-    group_name="credit_model_training"
-)
-def model_coefficients(mlflow_credit_model):
-    """
-        coeffients dari registered logistic regression model untuk membentuk scorecard
-    """
-    try:
-        empty_list = []
-        return empty_list
-    
-    except Exception as e:
-        logger.error("An error occurred while filtering highly correlated features: %s", str(e))
-        raise e
-
 
 @asset(
-    group_name="credit_model_training"
+    ins={"mlflow_credit_model": AssetIn(key="mlflow_credit_model")},
+    group_name="build_scorecard",
+    code_version="0.1",
+    tags={"asset_type": "scorecard-model"},
+    owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
+    compute_kind="pandas",
+    description="Generate scorecard dengan OptBinning & LogReg Model"
 )
-def score_card(model_coefficients):
+def score_card(context, mlflow_credit_model):
     """
-        credit scorecard 
+    Creates a credit scorecard using OptBinning's Scorecard class.
+    The scorecard converts model predictions into easily interpretable point values.
     """
     try:
-        empty_list = []
-        return empty_list
+        ## load modl dan dataset
+        model_run_id = mlflow_credit_model["run_id"]
+        model = mlflow.sklearn.load_model(f"runs:/{model_run_id}/trained_credit_logreg")
+        df = pd.read_csv("./data/outputs/application_selected_features.csv")
+        
+        feature_names = list(df.drop(["credit_event"], axis=1).columns)
+        X = df[feature_names]
+        y = df["credit_event"].values
+        
+        ## extract components dari model logreg model
+        estimator = model.named_steps['estimator']
+        binning_process = model.named_steps['binning_process']
+        
+        ## init scorecard
+        scorecard = Scorecard(
+            binning_process=binning_process,
+            estimator=estimator,
+            scaling_method="pdo_odds",
+            scaling_method_params={
+                "pdo": 20,
+                "odds": 50,
+                "scorecard_points": 600
+            },
+            intercept_based=True,
+            reverse_scorecard=False,
+            rounding=True
+        )
+        
+        ## fit scorecard
+        scorecard.fit(X, y)
+        
+        ## generate table scorecard
+        summary_table = scorecard.table(style='summary')
+        detailed_table = scorecard.table(style='detailed')
+        
+        ## export table
+        summary_table.to_csv("./data/outputs/scorecard_summary.csv", index=False)
+        detailed_table.to_csv("./data/outputs/scorecard_detailed.csv", index=False)
+        
+        ## log scorecard info
+        context.log.info("\nScorecard Summary:")
+        context.log.info(summary_table)
+        
+        ## calc statistik score
+        scores = scorecard.score(X)
+        score_stats = {
+            "min_score": int(np.min(scores)),
+            "max_score": int(np.max(scores)),
+            "mean_score": float(np.mean(scores)),
+            "median_score": float(np.median(scores)),
+            "std_score": float(np.std(scores))
+        }
+        
+        ## simpan object scorecard
+        scorecard.save("./data/outputs/scorecard.pkl")
+        
+        ## generate plots performance scorecard dan export ke png
+        y_pred_proba = scorecard.predict_proba(X)[:, 1]
+        
+        for plot_type, plot_func in [
+            ("roc", plot_auc_roc), 
+            ("cap", plot_cap), 
+            ("ks", plot_ks)
+        ]:
+            plt.figure(figsize=(10, 6))
+            plot_func(y, y_pred_proba, title=f"{plot_type.upper()} Curve - Scorecard Performance")
+            plt.tight_layout()
+            plt.savefig(f"./data/outputs/scorecard_{plot_type}.png")
+            plt.close()
+        
+        ## log ke MLflow
+        with mlflow.start_run(run_id=model_run_id):
+            mlflow.log_artifacts("./data/outputs", "scorecard_artifacts")
+            mlflow.log_params({
+                "scorecard_pdo": 20,
+                "scorecard_base_odds": 50,
+                "scorecard_base_points": 600
+            })
+            mlflow.log_metrics(score_stats)
+        
+        return Output(
+            value=scorecard,
+            metadata={
+                "feature_count": len(feature_names),
+                "score_range": f"{score_stats['min_score']} to {score_stats['max_score']}",
+                "mean_score": score_stats['mean_score'],
+                "median_score": score_stats['median_score'],
+                "std_score": score_stats['std_score'],
+                "scaling_method": "pdo_odds",
+                "pdo": 20,
+                "base_score": 600,
+                "base_odds": 50,
+                "artifacts": {
+                    "summary_table": "./data/outputs/scorecard_summary.csv",
+                    "detailed_table": "./data/outputs/scorecard_detailed.csv",
+                    "scorecard_object": "./data/outputs/scorecard.pkl",
+                    "performance_plots": [
+                        "./data/outputs/scorecard_roc.png",
+                        "./data/outputs/scorecard_cap.png",
+                        "./data/outputs/scorecard_ks.png"
+                    ]
+                }
+            }
+        )
     
     except Exception as e:
-        logger.error("An error occurred while filtering highly correlated features: %s", str(e))
+        context.log.error(f"An error occurred while generating the scorecard: {str(e)}")
         raise e
-    

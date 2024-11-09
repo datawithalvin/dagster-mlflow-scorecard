@@ -1,0 +1,106 @@
+Variable,Bin,Points
+months_since_last_pymnt_d_last_credit_pull_d,"(-inf, 0.50)",93.0
+months_since_last_pymnt_d_last_credit_pull_d,"[0.50, inf)",0.0
+months_since_last_pymnt_d_last_credit_pull_d,Special,33.0
+months_since_last_pymnt_d_last_credit_pull_d,Missing,33.0
+months_since_issue_d_last_credit_pull_d,"(-inf, 3.50)",68.0
+months_since_issue_d_last_credit_pull_d,"[3.50, 4.50)",45.0
+months_since_issue_d_last_credit_pull_d,"[4.50, 5.50)",37.0
+months_since_issue_d_last_credit_pull_d,"[5.50, 6.50)",23.0
+months_since_issue_d_last_credit_pull_d,"[6.50, 7.50)",14.0
+months_since_issue_d_last_credit_pull_d,"[7.50, 8.50)",8.0
+months_since_issue_d_last_credit_pull_d,"[8.50, 9.50)",8.0
+months_since_issue_d_last_credit_pull_d,"[9.50, 10.50)",5.0
+months_since_issue_d_last_credit_pull_d,"[10.50, 11.50)",2.0
+months_since_issue_d_last_credit_pull_d,"[11.50, inf)",0.0
+months_since_issue_d_last_credit_pull_d,Special,19.0
+months_since_issue_d_last_credit_pull_d,Missing,19.0
+out_prncp_inv,"(-inf, 209.17)",0.0
+out_prncp_inv,"[209.17, 4518.80)",90.0
+out_prncp_inv,"[4518.80, 6179.58)",111.0
+out_prncp_inv,"[6179.58, 16075.16)",89.0
+out_prncp_inv,"[16075.16, 28687.32)",85.0
+out_prncp_inv,"[28687.32, inf)",70.0
+out_prncp_inv,Special,73.0
+out_prncp_inv,Missing,73.0
+grade,['A'],54.0
+grade,['B'],40.0
+grade,['C'],24.0
+grade,['D'],8.0
+grade,['E' 'F' 'G'],0.0
+grade,Special,22.0
+grade,Missing,22.0
+last_pymnt_amnt,"(-inf, 138.11)",0.0
+last_pymnt_amnt,"[138.11, 1684.70)",23.0
+last_pymnt_amnt,"[1684.70, inf)",179.0
+last_pymnt_amnt,Special,24.0
+last_pymnt_amnt,Missing,24.0
+dti,"(-inf, 6.15)",12.0
+dti,"[6.15, 8.82)",19.0
+dti,"[8.82, 11.22)",14.0
+dti,"[11.22, 15.89)",14.0
+dti,"[15.89, 18.32)",12.0
+dti,"[18.32, 22.32)",10.0
+dti,"[22.32, 25.74)",7.0
+dti,"[25.74, 31.59)",4.0
+dti,"[31.59, inf)",0.0
+dti,Special,9.0
+dti,Missing,9.0
+total_rev_hi_lim,"(-inf, 6625.00)",0.0
+total_rev_hi_lim,"[6625.00, 10825.00)",2.0
+total_rev_hi_lim,"[10825.00, 16910.00)",4.0
+total_rev_hi_lim,"[16910.00, 22110.00)",5.0
+total_rev_hi_lim,"[22110.00, 26502.50)",5.0
+total_rev_hi_lim,"[26502.50, 37850.00)",6.0
+total_rev_hi_lim,"[37850.00, 49219.00)",8.0
+total_rev_hi_lim,"[49219.00, 80450.00)",10.0
+total_rev_hi_lim,"[80450.00, inf)",12.0
+total_rev_hi_lim,Special,5.0
+total_rev_hi_lim,Missing,5.0
+total_rec_int,"(-inf, 156.39)",0.0
+total_rec_int,"[156.39, 288.18)",7.0
+total_rec_int,"[288.18, 453.84)",8.0
+total_rec_int,"[453.84, 657.51)",9.0
+total_rec_int,"[657.51, 946.99)",10.0
+total_rec_int,"[946.99, 1276.35)",12.0
+total_rec_int,"[1276.35, 1593.73)",16.0
+total_rec_int,"[1593.73, 2658.99)",13.0
+total_rec_int,"[2658.99, inf)",12.0
+total_rec_int,Special,10.0
+total_rec_int,Missing,10.0
+months_since_earliest_cr_line,"(-inf, 105.50)",0.0
+months_since_earliest_cr_line,"[105.50, 155.50)",2.0
+months_since_earliest_cr_line,"[155.50, 173.50)",2.0
+months_since_earliest_cr_line,"[173.50, 201.50)",2.0
+months_since_earliest_cr_line,"[201.50, 237.50)",3.0
+months_since_earliest_cr_line,"[237.50, 371.50)",3.0
+months_since_earliest_cr_line,"[371.50, inf)",5.0
+months_since_earliest_cr_line,Special,2.0
+months_since_earliest_cr_line,Missing,2.0
+revol_util,"(-inf, 24.95)",5.0
+revol_util,"[24.95, 39.95)",6.0
+revol_util,"[39.95, 46.45)",9.0
+revol_util,"[46.45, 51.45)",6.0
+revol_util,"[51.45, 78.05)",4.0
+revol_util,"[78.05, 87.25)",3.0
+revol_util,"[87.25, inf)",0.0
+revol_util,Special,5.0
+revol_util,Missing,5.0
+tot_cur_bal,"(-inf, 48967.50)",0.0
+tot_cur_bal,"[48967.50, 80854.50)",2.0
+tot_cur_bal,"[80854.50, 139625.50)",3.0
+tot_cur_bal,"[139625.50, 185132.00)",7.0
+tot_cur_bal,"[185132.00, 217915.50)",13.0
+tot_cur_bal,"[217915.50, inf)",6.0
+tot_cur_bal,Special,3.0
+tot_cur_bal,Missing,3.0
+verification_status,['Not Verified'],12.0
+verification_status,['Source Verified'],4.0
+verification_status,['Verified'],0.0
+verification_status,Special,4.0
+verification_status,Missing,4.0
+inq_last_6mths,"(-inf, 0.50)",9.0
+inq_last_6mths,"[0.50, 1.50)",4.0
+inq_last_6mths,"[1.50, inf)",0.0
+inq_last_6mths,Special,6.0
+inq_last_6mths,Missing,6.0
