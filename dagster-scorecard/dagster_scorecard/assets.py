@@ -13,7 +13,7 @@ from dagster import (
 )
 
 from optbinning import BinningProcess
-from optbinning.scorecard import Scorecard, plot_auc_roc, plot_cap, plot_ks
+from optbinning.scorecard import Scorecard, plot_auc_roc, plot_cap, plot_ks, ScorecardMonitoring
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
@@ -58,6 +58,8 @@ def train_test_set(context):
         conn = duckdb.connect(os.getenv("DUCKDB_DATABASE"))
         train_test_set = conn.execute(query).fetch_df()
         train_test_set.drop_duplicates(subset=['id'], keep='first', inplace=True, ignore_index=True)
+
+        conn.close()
 
         ## log dataframe
         context.log.info("train-test shape: %s", train_test_set.shape)
@@ -470,11 +472,11 @@ def mlflow_rf_model(context):
         
         ## set model parameter
         params = {
-            "classifier__n_estimators": [100, 200, 300, 400],
+            "classifier__n_estimators": [100, 200],
             "classifier__max_features": ["sqrt"],
-            "classifier__max_depth": [10, 20, None],
+            "classifier__max_depth": [10, None],
             "classifier__min_samples_split": [5],
-            "classifier__min_samples_leaf": [2, 4],
+            "classifier__min_samples_leaf": [2],
             "classifier__bootstrap": [True],
             "classifier__class_weight":["balanced"]
         }
@@ -485,11 +487,10 @@ def mlflow_rf_model(context):
         rf_random = RandomizedSearchCV(
             estimator=pipeline, 
             param_distributions=params, 
-            n_iter=10, 
+            n_iter=5, 
             cv=cv, 
             verbose=2, 
             random_state=777, 
-            # n_jobs=-1,
             scoring="roc_auc"
         )
 
@@ -575,15 +576,15 @@ def mlflow_rf_model(context):
             plt.close()
 
             ## log model
-            signature = infer_signature(X_train_selected, selected_rf.predict(X_train_selected))
-            # mlflow.sklearn.log_model(selected_rf, "random_forest_model")
-            mlflow.sklearn.log_model(
-                sk_model=selected_rf,
-                registered_model_name="random_forest_model",
-                input_example=X_train_selected,
-                signature=signature,
-                artifact_path="BestRandomForestModel"
-            )
+            # signature = infer_signature(X_train_selected, selected_rf.predict(X_train_selected))
+            mlflow.sklearn.log_model(selected_rf, "random_forest_model")
+            # mlflow.sklearn.log_model(
+            #     sk_model=selected_rf,
+            #     registered_model_name="random_forest_model",
+            #     input_example=X_train_selected,
+            #     signature=signature,
+            #     artifact_path="BestRandomForestModel"
+            # )
 
             ## register model
             model_uri = f"runs:/{run.info.run_id}/random_forest_model"
@@ -708,10 +709,10 @@ def mlflow_credit_model(context):
         ])
 
         param_grid = {
-            'estimator__penalty': ['l1', 'l2', 'none'],
-            'estimator__C': [0.01, 0.1, 1, 10],
+            'estimator__penalty': ['l1', 'l2'],
+            'estimator__C': [0.1, 1, 10],
             'estimator__class_weight': ['balanced'],
-            'estimator__solver': ['liblinear', 'saga'],
+            'estimator__solver': ['liblinear'],
         }
 
         ## pakai stratified kfold supaya distribusi target tetap terjaga
@@ -872,7 +873,7 @@ def score_card(context, mlflow_credit_model):
         }
         
         ## simpan object scorecard
-        scorecard.save("./data/outputs/scorecard.pkl")
+        scorecard.save("./data/outputs/objects/scorecard.pkl")
         
         ## generate plots performance scorecard dan export ke png
         y_pred_proba = scorecard.predict_proba(X)[:, 1]
@@ -885,7 +886,7 @@ def score_card(context, mlflow_credit_model):
             plt.figure(figsize=(10, 6))
             plot_func(y, y_pred_proba, title=f"{plot_type.upper()} Curve - Scorecard Performance")
             plt.tight_layout()
-            plt.savefig(f"./data/outputs/scorecard_{plot_type}.png")
+            plt.savefig(f"./data/outputs/plots/scorecard_{plot_type}.png")
             plt.close()
         
         ## log ke MLflow
@@ -915,9 +916,9 @@ def score_card(context, mlflow_credit_model):
                     "detailed_table": "./data/outputs/scorecard_detailed.csv",
                     "scorecard_object": "./data/outputs/scorecard.pkl",
                     "performance_plots": [
-                        "./data/outputs/scorecard_roc.png",
-                        "./data/outputs/scorecard_cap.png",
-                        "./data/outputs/scorecard_ks.png"
+                        "./data/outputs/plots/scorecard_roc.png",
+                        "./data/outputs/plots/scorecard_cap.png",
+                        "./data/outputs/plots/scorecard_ks.png"
                     ]
                 }
             }
@@ -925,4 +926,299 @@ def score_card(context, mlflow_credit_model):
     
     except Exception as e:
         context.log.error(f"An error occurred while generating the scorecard: {str(e)}")
+        raise e
+
+
+@asset(
+    group_name="scorecard_validation",
+    tags={"asset_type":"DuckDBResource", 
+          "data_source":"loan_data_2015.db"},
+    code_version="0.1",
+    owners=["alvinnoza.data@gmail.com", "team:Data Scientist"],
+    compute_kind="duckdb",
+    description="Load validation set table ke pandas dataframe"
+)
+def validation_set(context):
+    try:
+        """
+        """
+        ## load data
+        query = """SELECT * FROM validation_set"""
+        conn = duckdb.connect(os.getenv("DUCKDB_DATABASE"))
+        validation_set = conn.execute(query).fetch_df()
+        validation_set.drop_duplicates(subset=['id'], keep='first', inplace=True, ignore_index=True)
+
+        conn.close()
+
+        ## log dataframe
+        context.log.info("train-test shape: %s", validation_set.shape)
+        context.log.info("first five rows: \n%s", validation_set.head())
+
+        ## materialisasi schema
+        columns = [
+            TableColumn(name=col, type=str(validation_set[col].dtype),
+                        description=f"Sample value: {validation_set[col].iloc[33]}")
+            for col in validation_set.columns
+        ]
+
+        n_rows = validation_set.shape[0]
+        n_cols = validation_set.shape[1]
+
+        yield MaterializeResult(
+                metadata={
+                    "dagster/column_schema": TableSchema(columns=columns),
+                    "dagster/type": "pandas-dataframe",
+                    "dagster/column_count": n_cols,
+                    "dagster/row_count": n_rows
+                }
+            )
+        
+        return validation_set.to_csv("./data/outputs/validation-set.csv", index=False)
+
+    except Exception as e:
+        context.log.error("An error occurred while build database connection/load credit application table: %s", str(e))
+        raise e
+
+@asset(
+    deps=["validation_set"],
+    group_name="scorecard_validation",
+    tags={"asset_type":"pandas-dataframe", 
+          "data_source":"loan_data_2015.db"},
+    code_version="0.1",
+    owners=["alvinnoza.data@gmail.com", "team:Data Scientist"],
+    compute_kind="pandas",
+    description="Prepare validation set"
+)
+def prepared_validation(context):
+    try:
+        """
+        """
+        ## load data
+        validation_set = pd.read_csv("./data/outputs/validation-set.csv")
+        validation_set.drop_duplicates(subset=['id'], keep='first', inplace=True, ignore_index=True)
+
+        ## cleaning emp_length
+        def emp_length_converter(dataframe, column):
+            dataframe[column] = dataframe[column].replace({
+                r"\+ years": "",
+                r"< 1 year": "0",
+                r" years?": ""
+            }, regex=True)
+            
+            dataframe[column] = pd.to_numeric(dataframe[column], errors='coerce').fillna(0).astype(int)
+
+        ## apply
+        emp_length_converter(validation_set, "emp_length")
+
+        ## remove whitespace
+        ## coba keep sbg categorical dulu aja
+        validation_set["term"] = validation_set["term"].str.lstrip()
+
+        ## last_pymnt_d dan last_credit_pull_d punya missing values, padahal kita butuh convert dan hitung time difference mereka
+        ## karena missingnya last_pymnt_d kurang dari 5%, rasanya masih save untuk didrop
+        ## drop rows 
+        validation_set.dropna(subset=["last_pymnt_d", "last_credit_pull_d"], inplace=True)
+
+        ## cleaning date-related columns
+        def convert_and_calc_moths(df):
+            ## define kolom
+            date_columns = ['earliest_cr_line', 'issue_d', 'last_pymnt_d', 'last_credit_pull_d']
+            
+            # convert ke datetime
+            for col in date_columns:
+                df[col] = pd.to_datetime(df[col], format='%b-%y', errors='coerce')
+            
+            ## hitung time difference antara issue date dgn earliest credit line
+            df['months_since_earliest_cr_line'] = (df['issue_d'].dt.year - df['earliest_cr_line'].dt.year) * 12 + \
+                                                (df['issue_d'].dt.month - df['earliest_cr_line'].dt.month)
+            
+            ## hitung time difference antara last payment date dng issue date
+            df['months_since_issue_d_last_pymnt_d'] = (df['last_pymnt_d'].dt.year - df['issue_d'].dt.year) * 12 + \
+                                                    (df['last_pymnt_d'].dt.month - df['issue_d'].dt.month)
+            
+            ## hitung time difference antara last credit pull date and last payment date
+            df['months_since_last_pymnt_d_last_credit_pull_d'] = (df['last_credit_pull_d'].dt.year - df['last_pymnt_d'].dt.year) * 12 + \
+                                                                (df['last_credit_pull_d'].dt.month - df['last_pymnt_d'].dt.month)
+            
+            ## hitung time difference antara issue date and last credit pull date
+            df['months_since_issue_d_last_credit_pull_d'] = (df['last_credit_pull_d'].dt.year - df['issue_d'].dt.year) * 12 + \
+                                                            (df['last_credit_pull_d'].dt.month - df['issue_d'].dt.month)
+
+            ## drop kolom original
+            df.drop(columns=date_columns, inplace=True)
+            
+            return df
+
+        ## apply function
+        validation_set = convert_and_calc_moths(validation_set)
+
+        ## filter features
+        ## ambil features dari latest selected features untuk train-test
+        app_selected_feats = pd.read_csv("./data/outputs/application_selected_features.csv")
+        selected_features = app_selected_feats.columns.tolist()
+        print(selected_features)
+        selected_features.extend(["credit_event"])
+
+        validation_set_filtered = validation_set[selected_features]
+
+        ## log dataframe
+        context.log.info("validation shape: %s", validation_set_filtered.shape)
+        context.log.info("first five rows: \n%s", validation_set_filtered.head())
+
+        ## materialisasi schema
+        columns = [
+            TableColumn(name=col, type=str(validation_set_filtered[col].dtypes),
+                        description=f"Sample value: {validation_set_filtered[col].iloc[33]}")
+            for col in validation_set_filtered.columns
+        ]
+
+        n_rows = validation_set_filtered.shape[0]
+        n_cols = validation_set_filtered.shape[1]
+
+        yield MaterializeResult(
+                metadata={
+                    "dagster/column_schema": TableSchema(columns=columns),
+                    "dagster/type": "pandas-dataframe",
+                    "dagster/column_count": n_cols,
+                    "dagster/row_count": n_rows
+                }
+            )
+        
+        return validation_set_filtered.to_csv("./data/outputs/prep-validation-set.csv", index=False)
+
+    except Exception as e:
+        context.log.error("An error occurred while build database connection/load credit application table: %s", str(e))
+        raise e
+
+@asset(
+    deps=["prepared_validation", "score_card"],
+    group_name="scorecard_validation",
+    code_version="0.1",
+    tags={"asset_type": "model-validation"},
+    owners=["alvinnoza.data@gmail.com", "team:data-scientist"],
+    compute_kind="pandas",
+    description="Validate scorecard using OptBinning's ScorecardMonitoring"
+)
+def scorecard_validation(context):
+    """
+    Validates the scorecard using OptBinning's ScorecardMonitoring class.
+    Includes:
+    - Population Stability Analysis
+    - Variable-level PSI Analysis
+    - Statistical Tests
+    - Performance Metrics
+    """
+    try:
+        # Load training and validation data
+        train_df = pd.read_csv("./data/outputs/application_selected_features.csv")
+        val_df = pd.read_csv("./data/outputs/prep-validation-set.csv")
+        score_card = Scorecard.load("./data/outputs/objects/scorecard.pkl")
+        
+        # Get features and targets
+        features = list(train_df.drop(['credit_event'], axis=1).columns)
+        X_train = train_df[features]
+        y_train = train_df['credit_event']
+        X_val = val_df[features]
+        y_val = val_df['credit_event']
+        
+        # Initialize scorecard monitoring
+        monitor = ScorecardMonitoring(
+            scorecard=score_card,
+            psi_method="cart",
+            psi_n_bins=20,
+            psi_min_bin_size=0.05,
+            show_digits=2
+        )
+        
+        # Fit monitoring with actual (validation) and expected (training) data
+        monitor.fit(
+            X_actual=X_val,
+            y_actual=y_val,
+            X_expected=X_train,
+            y_expected=y_train
+        )
+        
+        # Generate monitoring reports
+        psi_table = monitor.psi_table()
+        var_psi = monitor.psi_variable_table(style='detailed')
+        stat_tests = monitor.tests_table()
+        
+        # Save reports
+        psi_table.to_csv("./data/outputs/validation/psi_table.csv", index=False)
+        var_psi.to_csv("./data/outputs/validation/variable_psi.csv", index=False)
+        stat_tests.to_csv("./data/outputs/validation/statistical_tests.csv", index=False)
+        
+        # Generate PSI plot
+        plt.figure(figsize=(10, 6))
+        monitor.psi_plot()
+        plt.savefig("./data/outputs/validation/psi_plot.png")
+        plt.close()
+        
+        # Calculate scores and performance metrics
+        train_scores = score_card.score(X_train)
+        val_scores = score_card.score(X_val)
+        
+        val_proba = score_card.predict_proba(X_val)[:, 1]
+        
+        # Performance plots
+        plt.figure(figsize=(10, 6))
+        plot_auc_roc(y_val, val_proba, title="Validation ROC Curve")
+        plt.savefig("./data/outputs/validation/val_roc.png")
+        plt.close()
+        
+        plt.figure(figsize=(10, 6))
+        plot_ks(y_val, val_proba, title="Validation KS Plot")
+        plt.savefig("./data/outputs/validation/val_ks.png")
+        plt.close()
+        
+        # Calculate performance metrics
+        metrics = {
+            "val_roc_auc": roc_auc_score(y_val, val_proba),
+            "val_precision": precision_score(y_val, score_card.predict(X_val)),
+            "val_recall": recall_score(y_val, score_card.predict(X_val)),
+            "train_mean_score": np.mean(train_scores),
+            "val_mean_score": np.mean(val_scores),
+            "score_diff": np.mean(train_scores) - np.mean(val_scores)
+        }
+        
+        # Print system stability report
+        stability_report = monitor.system_stability_report()
+        
+        # Log to MLflow
+        with mlflow.start_run():
+            # Log validation metrics
+            mlflow.log_metrics(metrics)
+            
+            # Log validation artifacts
+            mlflow.log_artifacts("./data/outputs/validation", "validation_artifacts")
+            
+            # Log PSI statistics
+            mlflow.log_metric("system_psi", float(psi_table['psi'].sum()))
+            
+        return Output(
+            value={
+                "metrics": metrics,
+                "psi_table": psi_table,
+                "variable_psi": var_psi,
+                "statistical_tests": stat_tests
+            },
+            metadata={
+                "roc_auc": float(metrics["val_roc_auc"]),
+                "score_difference": float(metrics["score_diff"]),
+                "system_psi": float(psi_table['psi'].sum()),
+                "artifacts": {
+                    "psi_table": "./data/outputs/validation/psi_table.csv",
+                    "variable_psi": "./data/outputs/validation/variable_psi.csv",
+                    "statistical_tests": "./data/outputs/validation/statistical_tests.csv",
+                    "plots": {
+                        "psi_plot": "./data/outputs/validation/psi_plot.png",
+                        "roc_curve": "./data/outputs/validation/val_roc.png",
+                        "ks_plot": "./data/outputs/validation/val_ks.png"
+                    }
+                }
+            }
+        )
+        
+    except Exception as e:
+        context.log.error(f"An error occurred during scorecard validation: {str(e)}")
         raise e
