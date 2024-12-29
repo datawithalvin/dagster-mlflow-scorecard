@@ -1057,7 +1057,9 @@ def prepared_validation(context):
         app_selected_feats = pd.read_csv("./data/outputs/application_selected_features.csv")
         selected_features = app_selected_feats.columns.tolist()
         print(selected_features)
-        selected_features.extend(["credit_event"])
+        # selected_features.extend(["credit_event"])
+        if "credit_event" not in selected_features:
+            selected_features.extend(["credit_event"])
 
         validation_set_filtered = validation_set[selected_features]
 
@@ -1090,6 +1092,7 @@ def prepared_validation(context):
         context.log.error("An error occurred while build database connection/load credit application table: %s", str(e))
         raise e
 
+
 @asset(
     deps=["prepared_validation", "score_card"],
     group_name="scorecard_validation",
@@ -1109,19 +1112,19 @@ def scorecard_validation(context):
     - Performance Metrics
     """
     try:
-        # Load training and validation data
+        ## load train-val data
         train_df = pd.read_csv("./data/outputs/application_selected_features.csv")
         val_df = pd.read_csv("./data/outputs/prep-validation-set.csv")
         score_card = Scorecard.load("./data/outputs/objects/scorecard.pkl")
         
-        # Get features and targets
+        ## get features & targets
         features = list(train_df.drop(['credit_event'], axis=1).columns)
         X_train = train_df[features]
         y_train = train_df['credit_event']
         X_val = val_df[features]
         y_val = val_df['credit_event']
         
-        # Initialize scorecard monitoring
+        ## init monitoring
         monitor = ScorecardMonitoring(
             scorecard=score_card,
             psi_method="cart",
@@ -1130,7 +1133,7 @@ def scorecard_validation(context):
             show_digits=2
         )
         
-        # Fit monitoring with actual (validation) and expected (training) data
+        ## fit monitoring with actual & expected data
         monitor.fit(
             X_actual=X_val,
             y_actual=y_val,
@@ -1138,29 +1141,49 @@ def scorecard_validation(context):
             y_expected=y_train
         )
         
-        # Generate monitoring reports
-        psi_table = monitor.psi_table()
-        var_psi = monitor.psi_variable_table(style='detailed')
+        ## get reports
+        psi_table = monitor.psi_table()  
+        var_psi_summary = monitor.psi_variable_table(style="summary")
+        var_psi_detailed = monitor.psi_variable_table(style="detailed")
         stat_tests = monitor.tests_table()
+        # stability_report = monitor.system_stability_report()
+
+        ## buat validation folder kalau belum exist
+        os.makedirs("./data/outputs/validation", exist_ok=True)
         
-        # Save reports
+        ## save reports
         psi_table.to_csv("./data/outputs/validation/psi_table.csv", index=False)
-        var_psi.to_csv("./data/outputs/validation/variable_psi.csv", index=False)
+        var_psi_summary.to_csv("./data/outputs/validation/variable_psi_summary.csv", index=False)
+        var_psi_detailed.to_csv("./data/outputs/validation/variable_psi_detailed.csv", index=False)
         stat_tests.to_csv("./data/outputs/validation/statistical_tests.csv", index=False)
         
-        # Generate PSI plot
+        ## generate classification report
+        y_pred = score_card.predict(X_val)
+        class_report = classification_report(y_val, y_pred)
+        with open("./data/outputs/validation/classification_report.txt", "w") as f:
+            f.write(class_report)
+        
+        ## generate confusion matrix
+        plt.figure(figsize=(10, 8))
+        cm = confusion_matrix(y_val, y_pred)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+        disp.plot(cmap='Blues')
+        plt.title('Validation Set Confusion Matrix')
+        plt.savefig("./data/outputs/validation/confusion_matrix.png")
+        plt.close()
+        
+        ## PSI plot
         plt.figure(figsize=(10, 6))
         monitor.psi_plot()
         plt.savefig("./data/outputs/validation/psi_plot.png")
         plt.close()
         
-        # Calculate scores and performance metrics
+        ## calculate scores & performance metrics
         train_scores = score_card.score(X_train)
         val_scores = score_card.score(X_val)
-        
         val_proba = score_card.predict_proba(X_val)[:, 1]
         
-        # Performance plots
+        ## performance plots
         plt.figure(figsize=(10, 6))
         plot_auc_roc(y_val, val_proba, title="Validation ROC Curve")
         plt.savefig("./data/outputs/validation/val_roc.png")
@@ -1171,7 +1194,7 @@ def scorecard_validation(context):
         plt.savefig("./data/outputs/validation/val_ks.png")
         plt.close()
         
-        # Calculate performance metrics
+        ## calculate metrics
         metrics = {
             "val_roc_auc": roc_auc_score(y_val, val_proba),
             "val_precision": precision_score(y_val, score_card.predict(X_val)),
@@ -1180,40 +1203,74 @@ def scorecard_validation(context):
             "val_mean_score": np.mean(val_scores),
             "score_diff": np.mean(train_scores) - np.mean(val_scores)
         }
+
+        ## buat experiment baru kalau belum ada
+        exp_name = "scorecard-validation"
+        try:
+            mlflow.create_experiment(exp_name)
+        except Exception:
+            pass
         
-        # Print system stability report
-        stability_report = monitor.system_stability_report()
+        mlflow.set_experiment(exp_name)
         
-        # Log to MLflow
+        ## total PSI
+        total_psi = float(psi_table.iloc[-1]["PSI"]) if "PSI" in psi_table.columns else None
+
+        ## log ke MLflow
         with mlflow.start_run():
-            # Log validation metrics
             mlflow.log_metrics(metrics)
-            
-            # Log validation artifacts
             mlflow.log_artifacts("./data/outputs/validation", "validation_artifacts")
             
-            # Log PSI statistics
-            mlflow.log_metric("system_psi", float(psi_table['psi'].sum()))
+            if total_psi is not None:
+                mlflow.log_metric("system_psi", total_psi)
             
+        ## calculate additional classification metrics
+        confusion_mat = confusion_matrix(y_val, y_pred).tolist()
+        tn, fp, fn, tp = confusion_matrix(y_val, y_pred).ravel()
+        
+        ## add confusion matrix based metrics
+        additional_metrics = {
+            "true_negatives": int(tn),
+            "false_positives": int(fp),
+            "false_negatives": int(fn),
+            "true_positives": int(tp),
+            "accuracy": float((tp + tn) / (tp + tn + fp + fn)),
+            "specificity": float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0,
+            "neg_pred_value": float(tn / (tn + fn)) if (tn + fn) > 0 else 0.0
+        }
+        metrics.update(additional_metrics)
+
         return Output(
             value={
                 "metrics": metrics,
                 "psi_table": psi_table,
-                "variable_psi": var_psi,
-                "statistical_tests": stat_tests
+                "variable_psi_summary": var_psi_summary,
+                "variable_psi_detailed": var_psi_detailed,
+                "statistical_tests": stat_tests,
+                "confusion_matrix": confusion_mat,
+                "classification_report": class_report
             },
             metadata={
                 "roc_auc": float(metrics["val_roc_auc"]),
                 "score_difference": float(metrics["score_diff"]),
-                "system_psi": float(psi_table['psi'].sum()),
+                "system_psi": total_psi,
                 "artifacts": {
                     "psi_table": "./data/outputs/validation/psi_table.csv",
-                    "variable_psi": "./data/outputs/validation/variable_psi.csv",
+                    "variable_psi_summary": "./data/outputs/validation/variable_psi_summary.csv", 
+                    "variable_psi_detailed": "./data/outputs/validation/variable_psi_detailed.csv",
                     "statistical_tests": "./data/outputs/validation/statistical_tests.csv",
+                    "classification_report": "./data/outputs/validation/classification_report.txt",
                     "plots": {
                         "psi_plot": "./data/outputs/validation/psi_plot.png",
                         "roc_curve": "./data/outputs/validation/val_roc.png",
-                        "ks_plot": "./data/outputs/validation/val_ks.png"
+                        "ks_plot": "./data/outputs/validation/val_ks.png",
+                        "confusion_matrix": "./data/outputs/validation/confusion_matrix.png"
+                    },
+                    "confusion_matrix_values": {
+                        "true_negatives": int(tn),
+                        "false_positives": int(fp),
+                        "false_negatives": int(fn),
+                        "true_positives": int(tp)
                     }
                 }
             }
