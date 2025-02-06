@@ -26,7 +26,6 @@ from sklearn.feature_selection import chi2
 import matplotlib.pyplot as plt
 
 import mlflow
-from mlflow.models import infer_signature
 
 from . procedures import calc_credit_metrics, is_dichotomic
 
